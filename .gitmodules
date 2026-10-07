@@ -1,0 +1,3 @@
+[submodule "extern/sphexa"]
+	path = extern/sphexa
+	url = https://github.com/sphexa-org/sphexa.git
