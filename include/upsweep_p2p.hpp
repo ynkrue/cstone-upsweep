@@ -22,7 +22,7 @@ using cstone::TreeNodeIndex;
  * @param[out] globDispl        index of first global leaf per rank, length numRanks + 1
  *
  * Mirrors FocusedOctree::globNumNodes_ and globDispl_, which cstone copies from the
- * SpaceCurveAssignment (numNodesPerRank, treeOffsets).
+ * SfcAssignment (numNodesPerRank, treeOffsets).
  */
 inline void assignGlobalLeaves(TreeNodeIndex numGlobalLeaves,
                                int numRanks,
@@ -84,6 +84,46 @@ void globalExchange(cstone::OctreeView<const KeyType> gOctree,
     cstone::scatter(gOctree.leafToInternalSpan(), gLeafQAll.data(), globQ.data());
     //! upsweep with the global tree
     upsweepFunction(gOctree.levelRangeSpan(), gOctree.childOffsets, globQ.data());
+}
+
+/*! @brief owner rank of every global tree node
+ *
+ * @param[in]  gOctree    global octree, identical on all ranks
+ * @param[in]  globDispl  index of first global leaf per rank, length numRanks + 1
+ * @param[out] nodeOwner  owner rank of each node (level-sorted layout), length gOctree.numNodes
+ *
+ * leaf: the rank whose leaf range contains it
+ * internal node: the owner of its first (lowest-key) child
+ */
+template<class KeyType>
+void computeNodeOwners(cstone::OctreeView<const KeyType> gOctree,
+                       std::span<const TreeNodeIndex> globDispl,
+                       std::span<int> nodeOwner)
+{
+    int numRanks = globDispl.size() - 1;
+
+    //! leaves: compute owner for each global leaf
+    for (int r = 0; r < numRanks; ++r)
+    {
+        for (TreeNodeIndex i = globDispl[r]; i < globDispl[r + 1]; ++i)
+        {
+            TreeNodeIndex nodeIdx = gOctree.leafToInternal[gOctree.numInternalNodes + i];
+            nodeOwner[nodeIdx]    = r;
+        }
+    }
+
+    //! internal nodes: compute owner for each internal node
+    for (int l = cstone::maxTreeLevel<KeyType>{} - 1; l >= 0; --l)
+    {
+        for (TreeNodeIndex p = gOctree.levelRange[l]; p < gOctree.levelRange[l + 1]; ++p)
+        {
+            TreeNodeIndex child = gOctree.childOffsets[p];
+            if (child != 0)
+            {
+                nodeOwner[p] = nodeOwner[child];
+            }
+        }
+    }
 }
 
 } // namespace upsweep_p2p

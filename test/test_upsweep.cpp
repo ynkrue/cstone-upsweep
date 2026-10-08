@@ -76,6 +76,33 @@ int main(int argc, char** argv)
     MPI_Reduce(&numErrors, &globalErrors, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     if (myRank == 0) { std::printf("%s\n", globalErrors == 0 ? "PASS" : "FAIL"); }
 
+    // step 2: owner of every node, same on all ranks
+    std::vector<int> nodeOwner(gOctree.numNodes, -1);
+    computeNodeOwners<KeyType>(gOctree, globDispl, nodeOwner);
+
+    // debug: owners of root + level-1 nodes, then cut parents (children with more than one owner)
+    if (myRank == 0)
+    {
+        std::printf("owner root %d | level 1:", nodeOwner[0]);
+        for (TreeNodeIndex i = gOctree.levelRange[1]; i < gOctree.levelRange[2]; ++i)
+        {
+            std::printf(" %d", nodeOwner[i]);
+        }
+        std::printf("\n");
+
+        for (TreeNodeIndex p = 0; p < gOctree.numInternalNodes; ++p)
+        {
+            TreeNodeIndex c = gOctree.childOffsets[p];
+            bool isCut      = false;
+            for (int k = 1; k < 8; ++k) { isCut |= nodeOwner[c + k] != nodeOwner[c]; }
+            if (!isCut) { continue; }
+
+            std::printf("cut parent node %3d prefix %lo owner %d, child owners:", p, gOctree.prefixes[p], nodeOwner[p]);
+            for (int k = 0; k < 8; ++k) { std::printf(" %d", nodeOwner[c + k]); }
+            std::printf("\n");
+        }
+    }
+
     MPI_Finalize();
     return globalErrors != 0;
 }
