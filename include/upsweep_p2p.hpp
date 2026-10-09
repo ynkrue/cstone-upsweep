@@ -5,6 +5,7 @@
 
 #include <mpi.h>
 
+#include "cstone/domain/index_ranges.hpp"
 #include "cstone/primitives/gather.hpp"
 #include "cstone/primitives/mpi_wrappers.hpp"
 #include "cstone/tree/octree.hpp"
@@ -77,6 +78,76 @@ void computeNodeOwners(cstone::OctreeView<const KeyType> gOctree,
     }
 }
 
+/*! @brief point-to-point message lists of the global upsweep
+ *
+ * indexed [parentLevel][rank]. Entries are node indices of children whose parent is at parentLevel.
+ *  sendRanges[l][r]: children I own, whose parent rank r owns (r != me)
+ *  recvRanges[l][r]: children rank r owns, whose parent I own (r != me)
+ * ascending node index (sender and receiver agree).
+ */
+struct UpsweepPlan
+{
+    std::vector<std::vector<cstone::IndexRanges<TreeNodeIndex>>> sendRanges;
+    std::vector<std::vector<cstone::IndexRanges<TreeNodeIndex>>> recvRanges;
+};
+
+/*! @brief compute the messages of the p2p global upsweep
+ *
+ * @param[in]  gOctree    global octree, same on all ranks
+ * @param[in]  nodeOwner  owner rank of each node
+ * @param[in]  numRanks   number of ranks
+ * @param[in]  myRank     executing rank
+ * @return                send and receive lists per parent level and rank
+ *
+ */
+template<class KeyType>
+UpsweepPlan computeUpsweepPlan(cstone::OctreeView<const KeyType> gOctree,
+                               std::span<const int> nodeOwner,
+                               int numRanks,
+                               int myRank)
+{
+    auto levelRange     = gOctree.levelRangeSpan();
+    int numParentLevels = int(levelRange.size()) - 2; // last level can only contain leaves
+
+    UpsweepPlan plan;
+    plan.sendRanges.assign(numParentLevels, std::vector<cstone::IndexRanges<TreeNodeIndex>>(numRanks));
+    plan.recvRanges.assign(numParentLevels, std::vector<cstone::IndexRanges<TreeNodeIndex>>(numRanks));
+
+    for (int l = 0; l < numParentLevels; ++l)
+    {
+        TreeNodeIndex firstParent = levelRange[l];
+        TreeNodeIndex lastParent  = levelRange[l + 1];
+
+        for (TreeNodeIndex p = firstParent; p < lastParent; ++p)
+        {
+            TreeNodeIndex firstChild = gOctree.childOffsets[p];
+            TreeNodeIndex lastChild  = firstChild + 8;
+            if (firstChild == 0) { continue; }
+
+            //! children of p grouped by owner: owners are sorted within a parent, e.g. 0 0 0 1 1 1 2 2
+            for (TreeNodeIndex c = firstChild; c < lastChild;)
+            {
+                int owner            = nodeOwner[c];
+                TreeNodeIndex runEnd = c;
+                while (runEnd < lastChild && nodeOwner[runEnd] == owner)
+                {
+                    ++runEnd;
+                }
+
+                if (owner == myRank && nodeOwner[p] != myRank)
+                {
+                    plan.sendRanges[l][nodeOwner[p]].addRange(c, runEnd);
+                }
+                if (owner != myRank && nodeOwner[p] == myRank) { plan.recvRanges[l][owner].addRange(c, runEnd); }
+
+                c = runEnd;
+            }
+        }
+    }
+
+    return plan;
+}
+
 /*! @brief collective global upsweep, mirrors FocusedOctree::globalExchange
  *
  * @param[in]  gOctree          global octree, identical on all ranks
@@ -109,6 +180,13 @@ void globalExchange(cstone::OctreeView<const KeyType> gOctree,
     //! upsweep with the global tree
     upsweepFunction(gOctree.levelRangeSpan(), gOctree.childOffsets, globQ.data());
 }
+
+
+// Questions:
+// - Is it enough that rank r only receives the global nodes extractGlobal reads?
+//   -> nodes mathing ranks LET leaves outside its own and peer ranges
+// - How to get the results back to the ranks? bcast or ask/reply?
+// - One communication round per level (latency?)
 
 template<class Q, class KeyType, class F>
 void globalExchangeP2p(cstone::OctreeView<const KeyType> gOctree,

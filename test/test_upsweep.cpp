@@ -62,6 +62,36 @@ int main(int argc, char** argv)
     std::vector<int> nodeOwner(gOctree.numNodes, -1);
     computeNodeOwners(gOctree, globDispl, nodeOwner);
 
+    UpsweepPlan plan = computeUpsweepPlan(gOctree, std::span<const int>(nodeOwner), numRanks, myRank);
+
+    //! debug: print the plan, one rank after the other; node indices, not keys
+    for (int r = 0; r < numRanks; ++r)
+    {
+        if (r == myRank)
+        {
+            for (std::size_t l = 0; l < plan.sendRanges.size(); ++l)
+            {
+                for (int peer = 0; peer < numRanks; ++peer)
+                {
+                    const auto& s  = plan.sendRanges[l][peer];
+                    const auto& rv = plan.recvRanges[l][peer];
+                    for (std::size_t i = 0; i < s.nRanges(); ++i)
+                    {
+                        std::printf("rank %d: level %zu  send to   %d  nodes [%d, %d)\n", myRank, l, peer,
+                                    s.rangeStart(i), s.rangeEnd(i));
+                    }
+                    for (std::size_t i = 0; i < rv.nRanges(); ++i)
+                    {
+                        std::printf("rank %d: level %zu  recv from %d  nodes [%d, %d)\n", myRank, l, peer,
+                                    rv.rangeStart(i), rv.rangeEnd(i));
+                    }
+                }
+            }
+            std::fflush(stdout);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
     globalExchangeP2p<Q>(gOctree, globNumNodes, globDispl, nodeOwner, gLeafQLoc, std::span<Q>(globQp2p), upsweep,
                          myRank, MPI_COMM_WORLD);
 
