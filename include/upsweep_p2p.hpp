@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdio>
 #include <span>
 #include <vector>
 
@@ -181,34 +182,96 @@ void globalExchange(cstone::OctreeView<const KeyType> gOctree,
     upsweepFunction(gOctree.levelRangeSpan(), gOctree.childOffsets, globQ.data());
 }
 
+//! @brief MPI tag base of the p2p upsweep, tag = base + parent level
+constexpr int upsweepP2pTag = 8000;
 
-// Questions:
-// - Is it enough that rank r only receives the global nodes extractGlobal reads?
-//   -> nodes mathing ranks LET leaves outside its own and peer ranges
-// - How to get the results back to the ranks? bcast or ask/reply?
-// - One communication round per level (latency?)
-
+/*! @brief point-to-point global upsweep
+ *
+ * @param[in]  gOctree          global octree, same on all ranks
+ * @param[in]  globNumNodes     number of global leaves per rank
+ * @param[in]  globDispl        index of first global leaf per rank
+ * @param[in]  plan             send/recv lists
+ * @param[in]  gLeafQLoc        quantities of the global leaves owned by the executing rank
+ * @param[out] globQ            quantities of global tree nodes
+ * @param[in]  upsweepFunction  callable object that will be used to compute internal cell properties of the
+ *                              global tree based on global leaf quantities
+ *
+ * One exchange round per parent level (deepest first)
+ * Post-condition on rank r: globQ[i] is final for every node i owned by r and every child of an
+ * internal node owned by r. All other entries are unspecified.
+ * 
+ * Open questions:
+ * - Is it enough that rank r only receives the global nodes extractGlobal reads?
+ *   -> nodes matching ranks LET leaves outside its own and peer ranges
+ * - How to get the results back to the ranks? bcast or ask/reply?
+ * - One communication round per level (latency?)
+ */
 template<class Q, class KeyType, class F>
 void globalExchangeP2p(cstone::OctreeView<const KeyType> gOctree,
-                        std::span<const TreeNodeIndex> globNumNodes,
-                        std::span<const TreeNodeIndex> globDispl,
-                        std::span<const int> nodeOwner,
-                        std::span<const Q> gLeafQLoc,
-                        std::span<Q> globQ,
-                        F&& upsweepFunction,
-                        int myRank,
-                        MPI_Comm comm)
+                       std::span<const TreeNodeIndex> globNumNodes,
+                       std::span<const TreeNodeIndex> globDispl,
+                       const UpsweepPlan& plan,
+                       std::span<const Q> gLeafQLoc,
+                       std::span<Q> globQ,
+                       F&& upsweepFunction,
+                       int myRank,
+                       MPI_Comm comm)
 {
-    // TODO
-    (void)gOctree;
-    (void)globNumNodes;
-    (void)globDispl;
-    (void)nodeOwner;
-    (void)gLeafQLoc;
-    (void)globQ;
-    (void)upsweepFunction;
-    (void)myRank;
-    (void)comm;
+    auto levelRange     = gOctree.levelRangeSpan();
+    auto leafToInternal = gOctree.leafToInternalSpan();
+    int numParentLevels = int(plan.sendRanges.size());
+    int numRanks        = int(globNumNodes.size());
+
+    cstone::scatter(leafToInternal.subspan(globDispl[myRank], globNumNodes[myRank]), gLeafQLoc.data(), globQ.data());
+    std::vector<std::vector<Q>> sendBuf(numRanks), recvBuf(numRanks);
+
+    for (int l = numParentLevels - 1; l >= 0; --l)
+    {
+        std::vector<MPI_Request> requests;
+        int tag = upsweepP2pTag + l;
+
+        for (int r = 0; r < numRanks; ++r)
+        {
+            const auto& recvRanges = plan.recvRanges[l][r];
+            if (recvRanges.totalCount() == 0) { continue; }
+            recvBuf[r].resize(recvRanges.totalCount());
+            mpiRecvAsync(recvBuf[r].data(), int(recvRanges.totalCount()), r, tag, requests, comm);
+        }
+
+        for (int r = 0; r < numRanks; ++r)
+        {
+            const auto& sendRanges = plan.sendRanges[l][r];
+            if (sendRanges.totalCount() == 0) { continue; }
+            sendBuf[r].resize(sendRanges.totalCount());
+            std::size_t writeIdx = 0;
+            for (std::size_t k = 0; k < sendRanges.nRanges(); ++k)
+            {
+                for (TreeNodeIndex i = sendRanges.rangeStart(k); i < sendRanges.rangeEnd(k); ++i)
+                {
+                    sendBuf[r][writeIdx++] = globQ[i];
+                }
+            }
+            mpiSendAsync(sendBuf[r].data(), int(sendRanges.totalCount()), r, tag, requests, comm);
+        }
+
+        MPI_Waitall(int(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+
+        for (int r = 0; r < numRanks; ++r)
+        {
+            const auto& recvRanges = plan.recvRanges[l][r];
+            if (recvRanges.totalCount() == 0) { continue; }
+            std::size_t readIdx = 0;
+            for (std::size_t k = 0; k < recvRanges.nRanges(); ++k)
+            {
+                for (TreeNodeIndex i = recvRanges.rangeStart(k); i < recvRanges.rangeEnd(k); ++i)
+                {
+                    globQ[i] = recvBuf[r][readIdx++];
+                }
+            }
+        }
+
+        upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data());
+    }
 }
 
 } // namespace upsweep_p2p
