@@ -61,7 +61,7 @@ int main(int argc, char** argv)
     std::vector<Q> globQp2p(gOctree.numNodes, 0.0);
     std::vector<int> nodeOwner(gOctree.numNodes, -1);
     computeNodeOwners(gOctree, globDispl, nodeOwner);
-    UpsweepPlan plan = computeUpsweepPlan(gOctree, std::span<const int>(nodeOwner), numRanks, myRank);
+    UpsweepPlan plan = computeUpsweepPlan(gOctree, std::span<const int>(nodeOwner), myRank);
     
     globalExchangeP2p<Q>(gOctree, globNumNodes, globDispl, plan, gLeafQLoc, std::span<Q>(globQp2p), upsweep,
                          myRank, MPI_COMM_WORLD);
@@ -94,12 +94,14 @@ int main(int argc, char** argv)
     int numErrorsQ = check(globQ, allNodes, "allgather");
     int globalErrors = 0;
     MPI_Reduce(&numErrorsQ, &globalErrors, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-    if (myRank == 0) { std::printf("Upsweep allgather: \t %s (%d errors)\n", globalErrors == 0 ? "PASS" : "FAIL", globalErrors); }
+    if (myRank == 0) { std::printf("Upsweep allgather: \t %s (%d errors)\n", globalErrors == 0 ? "PASS" : "FAIL",
+        globalErrors); }
     
     int numErrorsP2p    = check(globQp2p, ownedOrChildOfOwned, "p2p");
     int globalErrorsP2p = 0;
     MPI_Reduce(&numErrorsP2p, &globalErrorsP2p, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
-    if (myRank == 0) { std::printf("Upsweep p2p: \t\t %s (%d errors)\n", globalErrorsP2p == 0 ? "PASS" : "FAIL", globalErrorsP2p); }
+    if (myRank == 0) { std::printf("Upsweep p2p: \t\t %s (%d errors)\n", globalErrorsP2p == 0 ? "PASS" : "FAIL",
+        globalErrorsP2p); }
 
     MPI_Finalize();
     return globalErrors != 0 || globalErrorsP2p != 0;
