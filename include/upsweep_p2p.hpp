@@ -1,6 +1,14 @@
+/*! @file
+ * @brief point-to-point replacement of the Allgatherv in cstone's global upsweep
+ *        (FocusedOctree::globalExchange, cstone/focus/octree_focus_mpi.hpp)
+ *
+ * Once per global tree: computeNodeOwners, computeUpsweepPlan
+ * Per call:             globalUpsweep (upward pass), extractGlobalP2p (distribution)
+ */
+
 #pragma once
 
-#include <cstdio>
+#include <algorithm>
 #include <span>
 #include <utility>
 #include <vector>
@@ -11,51 +19,24 @@
 #include "cstone/primitives/gather.hpp"
 #include "cstone/primitives/mpi_wrappers.hpp"
 #include "cstone/tree/octree.hpp"
+#include "cstone/domain/layout.hpp"
+#include "cstone/sfc/common.hpp"
+
 
 namespace upsweep_p2p
 {
 
 using cstone::TreeNodeIndex;
 
-/*! @brief contiguous split of the global leaves across ranks
- *
- * @param[in]  numGlobalLeaves  number of global tree leaves
- * @param[in]  numRanks         number of ranks
- * @param[out] globNumNodes     number of global leaves per rank, length numRanks
- * @param[out] globDispl        index of first global leaf per rank, length numRanks + 1
- *
- * Mirrors FocusedOctree::globNumNodes_ and globDispl_, which cstone copies from the
- * SfcAssignment (numNodesPerRank, treeOffsets).
- */
-inline void assignGlobalLeaves(TreeNodeIndex numGlobalLeaves,
-                               int numRanks,
-                               std::vector<TreeNodeIndex>& globNumNodes,
-                               std::vector<TreeNodeIndex>& globDispl)
-{
-    globNumNodes.resize(numRanks);
-    globDispl.resize(numRanks + 1);
-    for (int r = 0; r <= numRanks; ++r)
-    {
-        globDispl[r] = TreeNodeIndex((long(numGlobalLeaves) * r) / numRanks);
-    }
-    for (int r = 0; r < numRanks; ++r)
-    {
-        globNumNodes[r] = globDispl[r + 1] - globDispl[r];
-    }
-}
-
 /*! @brief owner rank of every global tree node
  *
- * @param[in]  gOctree    global octree, identical on all ranks
+ * @param[in]  gOctree    global octree, same on all ranks
  * @param[in]  globDispl  index of first global leaf per rank, length numRanks + 1
  * @param[out] nodeOwner  owner rank of each node (level-sorted layout), length gOctree.numNodes
  *
- * leaf: the rank whose leaf range contains it
- * internal node: the owner of its first (lowest-key) child
  */
 template<class KeyType>
-void computeNodeOwners(cstone::OctreeView<const KeyType> gOctree,
-                       std::span<const TreeNodeIndex> globDispl,
+void computeNodeOwners(cstone::OctreeView<const KeyType> gOctree, std::span<const TreeNodeIndex> globDispl,
                        std::span<int> nodeOwner)
 {
     int numRanks = int(globDispl.size()) - 1;
@@ -104,12 +85,10 @@ struct UpsweepPlan
  *
  */
 template<class KeyType>
-UpsweepPlan computeUpsweepPlan(cstone::OctreeView<const KeyType> gOctree,
-                               std::span<const int> nodeOwner,
-                               int myRank)
+UpsweepPlan computeUpsweepPlan(cstone::OctreeView<const KeyType> gOctree, std::span<const int> nodeOwner, int myRank)
 {
-    auto levelRange     = gOctree.levelRangeSpan();
-    int numParentLevels = cstone::maxDepth(levelRange.data(), levelRange.size()); // deepest level has only leaves
+    auto levelRange      = gOctree.levelRangeSpan();
+    int  numParentLevels = cstone::maxDepth(levelRange.data(), levelRange.size()); // deepest level has only leaves
 
     UpsweepPlan plan;
     plan.send.resize(numParentLevels);
@@ -136,10 +115,10 @@ UpsweepPlan computeUpsweepPlan(cstone::OctreeView<const KeyType> gOctree,
             TreeNodeIndex lastChild  = firstChild + 8;
             if (firstChild == 0) { continue; }
 
-            //! children of p grouped by owner: owners are sorted within a parent, e.g. 0 0 0 1 1 1 2 2
+            //! children of p grouped by owner
             for (TreeNodeIndex c = firstChild; c < lastChild;)
             {
-                int owner            = nodeOwner[c];
+                int           owner  = nodeOwner[c];
                 TreeNodeIndex runEnd = c;
                 while (runEnd < lastChild && nodeOwner[runEnd] == owner)
                 {
@@ -157,87 +136,42 @@ UpsweepPlan computeUpsweepPlan(cstone::OctreeView<const KeyType> gOctree,
     return plan;
 }
 
-/*! @brief collective global upsweep, mirrors FocusedOctree::globalExchange
+/*! @brief point-to-point global upsweep, replaces the Allgatherv + redundant upsweep in globalExchange
  *
  * @param[in]  gOctree          global octree, identical on all ranks
- * @param[in]  globNumNodes     number of global leaves per rank
- * @param[in]  globDispl        index of first global leaf per rank
+ * @param[in]  globDispl        index of first global leaf per rank, length numRanks + 1
+ * @param[in]  plan             send/recv lists from computeUpsweepPlan
  * @param[in]  gLeafQLoc        quantities of the global leaves owned by the executing rank
- * @param[out] globQ            quantities of all global tree nodes (level-sorted layout), length gOctree.numNodes
- * @param[in]  upsweepFunction  callable(levelRange, childOffsets, Q*) performing the upsweep on the global tree
+ * @param[out] globQ            quantities of global tree nodes (level-sorted layout), length gOctree.numNodes
+ * @param[in]  upsweepFunction  callable(levelRange, childOffsets, Q*) combining the levels of the given span
+ * @param[in]  myRank           executing rank
+ * @param[in]  comm             MPI communicator
  *
- * Allgatherv of all leaves, then every rank does the full upsweep redundantly. In cstone,
- * gLeafQLoc comes from populateGlobal and globQ is passed on to extractGlobal
- */
-template<class Q, class KeyType, class F>
-void globalExchange(cstone::OctreeView<const KeyType> gOctree,
-                    std::span<const TreeNodeIndex> globNumNodes,
-                    std::span<const TreeNodeIndex> globDispl,
-                    std::span<const Q> gLeafQLoc,
-                    std::span<Q> globQ,
-                    F&& upsweepFunction,
-                    int myRank,
-                    MPI_Comm comm)
-{
-    std::vector<Q> gLeafQAll(gOctree.numLeafNodes);
-
-    //! exchange global leaves
-    mpiAllgatherv(gLeafQLoc.data(), globNumNodes[myRank], gLeafQAll.data(), globNumNodes.data(),
-                  globDispl.data(), comm);
-
-    cstone::scatter(gOctree.leafToInternalSpan(), gLeafQAll.data(), globQ.data());
-    //! upsweep with the global tree
-    upsweepFunction(gOctree.levelRangeSpan(), gOctree.childOffsets, globQ.data());
-}
-
-//! @brief MPI tag base of the p2p upsweep, tag = base + parent level
-constexpr int upsweepP2pTag = 6500;
-
-/*! @brief point-to-point global upsweep
- *
- * @param[in]  gOctree          global octree, same on all ranks
- * @param[in]  globNumNodes     number of global leaves per rank
- * @param[in]  globDispl        index of first global leaf per rank
- * @param[in]  plan             send/recv lists
- * @param[in]  gLeafQLoc        quantities of the global leaves owned by the executing rank
- * @param[out] globQ            quantities of global tree nodes
- * @param[in]  upsweepFunction  callable object that will be used to compute internal cell properties of the
- *                              global tree based on global leaf quantities
- *
- * One exchange round per parent level (deepest first)
+ * One exchange round per parent level, deepest first: children go to the owner of their parent,
+ * then the parent level is combined.
  * Post-condition on rank r: globQ[i] is final for every node i owned by r and every child of an
  * internal node owned by r. All other entries are unspecified.
- * 
- * Open questions:
- * - Is it enough that rank r only receives the global nodes extractGlobal reads?
- *   -> nodes matching ranks LET leaves outside its own and peer ranges
- * - How to get the results back to the ranks? bcast or ask/reply?
- * - One communication round per level (latency?)
  */
 template<class Q, class KeyType, class F>
-void globalExchangeP2p(cstone::OctreeView<const KeyType> gOctree,
-                       std::span<const TreeNodeIndex> globNumNodes,
-                       std::span<const TreeNodeIndex> globDispl,
-                       const UpsweepPlan& plan,
-                       std::span<const Q> gLeafQLoc,
-                       std::span<Q> globQ,
-                       F&& upsweepFunction,
-                       int myRank,
-                       MPI_Comm comm)
+void globalUpsweep(cstone::OctreeView<const KeyType> gOctree, std::span<const TreeNodeIndex> globDispl,
+                   std::span<const int>     nodeOwner, // temporary: becomes nodeOwner_ in cstone
+                   std::span<const Q> gLeafQLoc, std::span<Q> globQ, F&& upsweepFunction, int myRank, MPI_Comm comm)
 {
     auto levelRange     = gOctree.levelRangeSpan();
     auto leafToInternal = gOctree.leafToInternalSpan();
-    int numParentLevels = int(plan.send.size());
 
-    cstone::scatter(leafToInternal.subspan(globDispl[myRank], globNumNodes[myRank]), gLeafQLoc.data(), globQ.data());
+    UpsweepPlan plan            = computeUpsweepPlan(gOctree, std::span<const int>(nodeOwner), myRank);
+    int         numParentLevels = int(plan.send.size());
+
+    cstone::scatter(leafToInternal.subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(), globQ.data());
 
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
-        const auto& send = plan.send[l];
-        const auto& recv = plan.recv[l];
+        const auto&                 send = plan.send[l];
+        const auto&                 recv = plan.recv[l];
         std::vector<std::vector<Q>> sendBuf(send.size()), recvBuf(recv.size());
-        std::vector<MPI_Request> requests;
-        int tag = upsweepP2pTag + l;
+        std::vector<MPI_Request>    requests;
+        int                         tag = upsweepP2pTag + l;
 
         for (std::size_t m = 0; m < recv.size(); ++m)
         {
@@ -278,6 +212,44 @@ void globalExchangeP2p(cstone::OctreeView<const KeyType> gOctree,
 
         upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data());
     }
+}
+
+/*! @brief Copy far LET leaves from their owning ranks.
+ *
+ * @param[in]  globalNodeKeys    global node keys referenced from the LET
+ * @param[in]  globalLevelRange  level ranges of the global tree used to locate nodes by index
+ * @param[in]  globalQuantities  quantities stored on the owning ranks
+ * @param[out] localQuantities   values written into the local LET slots that reference remote nodes
+ * @param[in]  comm              MPI communicator
+ */
+template<class T, class KeyType>
+void extractGlobalP2p(cstone::OctreeView<const KeyType>      let,        // temporary: octreeAcc_ in cstone
+                      std::span<const cstone::TreeIndexPair> peerRanges, // temporary: peerRanges_ in cstone
+                      const KeyType* globalNodeKeys, const TreeNodeIndex* globalLevelRange,
+                      std::span<const int> nodeOwner, // temporary: becomes nodeOwner_ in cstone
+                      std::span<const T> globalQuantities, std::span<T> localQuantities, MPI_Comm comm)
+{
+    // TODO part 1 (copy CPU branch of FocusedOctree::extractGlobal, octree_focus_mpi.hpp:301)
+    // - far LET leaves: enumerateRanges(invertRanges(0, peerRanges, let.numLeafNodes))
+    // - leaf → LET node ℓ: let.leafToInternal[let.numInternalNodes + j]
+    // - ℓ → global node g: locateNode(let.prefixes[ℓ], globalNodeKeys, globalLevelRange)
+    // - check: print #far leaves per rank (P = 3, L = 4: 854 / 869 / 855)
+
+    // TODO part 2a: sort (g, ℓ) pairs by (nodeOwner[g], g), group per owner → my g list + ℓ list per owner
+    // TODO part 2b: sendCounts[owner] = list size → MPI_Alltoall → recvCounts (copy computeExtractPlan)
+    // TODO part 2c: Irecv g lists from requesters, Isend my g lists to owners, Waitall (extractRequestTag)
+    // TODO part 2d: owner packs globalQuantities[g] per requester → Isend; Irecv per owner → Waitall
+    //               → localQuantities[ℓ] = value (extractValueTag)
+    // TODO after: delete ExtractPlan/computeExtractPlan, (void) leftovers, complete the @param list above
+    (void) let;
+    (void) peerRanges;
+    (void) globalNodeKeys;
+    (void) globalLevelRange;
+    (void) nodeOwner;
+    (void) globalQuantities;
+    (void) localQuantities;
+    (void) comm;
+
 }
 
 } // namespace upsweep_p2p
