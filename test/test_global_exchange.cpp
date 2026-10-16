@@ -1,7 +1,7 @@
 /*! @file
- * @brief test globalExchangeP2p against FocusedOctree::globalExchange
+ * @brief test globalUpsweep against a single-rank upsweep of the global tree
  *
- * Usage: test_global_exchange [L=4] [n=4] [theta=1.0]
+ * Usage: test_global_exchange [L=4] [n=4]
  */
 
 #include <algorithm>
@@ -14,9 +14,7 @@
 #include <mpi.h>
 
 #include "cstone/domain/domaindecomp.hpp"
-#include "cstone/focus/octree_focus_mpi.hpp"
 #include "cstone/sfc/sfc.hpp"
-#include "cstone/traversal/macs.hpp"
 #include "cstone/tree/cs_util.hpp"
 #include "cstone/tree/csarray.hpp"
 
@@ -34,11 +32,9 @@ int main(int argc, char** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-    int      numLevels       = argc > 1 ? std::atoi(argv[1]) : 4;   // L, 8^L global leaves
-    unsigned numPerCell      = argc > 2 ? std::atoi(argv[2]) : 4;   // particles per leaf
-    float    theta           = argc > 3 ? std::atof(argv[3]) : 1.0; // mac
-    unsigned bucketSize      = 4 * numPerCell;                      // n <= bucketSize < 8n
-    unsigned bucketSizeLocal = numPerCell;                          // LET leaf size inside the focus
+    int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 4; // L, 8^L global leaves
+    unsigned numPerCell = argc > 2 ? std::atoi(argv[2]) : 4; // particles per leaf
+    unsigned bucketSize = 4 * numPerCell;                    // n <= bucketSize < 8n
 
     cstone::Box<T> box(0, 1);
 
@@ -82,47 +78,22 @@ int main(int argc, char** argv)
     auto                           assignment = cstone::makeSfcAssignment(numRanks, gCounts, gLeaves.data());
     std::span<const TreeNodeIndex> globDispl  = assignment.treeOffsetsConst();
 
-    std::vector<int> nodeOwner(gOctree.numNodes, -1);
-    computeNodeOwners(gOctree, globDispl, nodeOwner);
-
-    //! LET, focused per rank
-    auto                 first = std::lower_bound(keys.begin(), keys.end(), assignment[myRank]);
-    auto                 last  = std::lower_bound(keys.begin(), keys.end(), assignment[myRank + 1]);
-    std::vector<KeyType> myKeys(first, last);
-
-    cstone::FocusedOctree<KeyType, T> focusTree(cstone::execution::cpu, myRank, numRanks, bucketSizeLocal,
-                                                MPI_COMM_WORLD);
-    focusTree.converge(box, myKeys, assignment, gLeaves, gCounts, cstone::invThetaMinMac(theta));
-
-    //! peerRanges_ (temporary: is private in focusTree)
-    std::vector<int> peerFlags = cstone::focusPeersAcc<KeyType>(
-        cstone::execution::cpu, globDispl, focusTree.assignment(), myRank, gLeaves, focusTree.treeLeaves());
-    std::vector<int> peers;
-    cstone::peerFlagsToList(peerFlags, peers, cstone::PeerMask::focus);
-    std::vector<cstone::TreeIndexPair> peerRanges;
-    cstone::extractPeerRanges(peers, myRank, focusTree.assignment(), peerRanges);
-
-    //! LET counts
-    auto                  letOctree = focusTree.octreeViewAcc();
-    std::vector<unsigned> letQIn(focusTree.countsAcc().begin(), focusTree.countsAcc().end());
-    auto farLeaves = cstone::enumerateRanges(cstone::invertRanges(0, peerRanges, letOctree.numLeafNodes));
-    for (TreeNodeIndex j : farLeaves)
-    {
-        letQIn[letOctree.leafToInternal[letOctree.numInternalNodes + j]] = 0xDEAD; // sentinel values
-    }
-
     auto upsweep = [](auto levelRange, auto childOffsets, auto Q)
     { cstone::upsweep(levelRange, childOffsets, Q, cstone::NodeCount<unsigned>{}); };
-    std::vector<int> scratch;
 
-    //! reference: Allgatherv version
-    std::vector<unsigned> letQRef = letQIn, globQRef(gOctree.numNodes);
-    focusTree.globalExchange(gOctree, std::span<unsigned>(letQRef), std::span<unsigned>(globQRef), scratch, upsweep);
+    //! reference: upsweep of all global leaves on one rank
+    std::vector<unsigned> globQRef(gOctree.numNodes);
+    cstone::scatter(gOctree.leafToInternalSpan(), gCounts.data(), globQRef.data());
+    upsweep(gOctree.levelRangeSpan(), gOctree.childOffsets, globQRef.data());
 
-    //! reimplementation: point-to-point version
-    std::vector<unsigned> letQ = letQIn, globQ(gOctree.numNodes);
-    globalExchangeP2p<unsigned>(focusTree, gOctree, std::span<unsigned>(letQ), std::span<unsigned>(globQ), scratch,
-                                globDispl, nodeOwner, peerRanges, myRank, MPI_COMM_WORLD, upsweep);
+    //! point-to-point upsweep of the global tree, Q = particle counts of my global leaves
+    std::vector<int> nodeOwner(gOctree.numNodes, -1);
+    computeNodeOwners(gOctree, globDispl, nodeOwner);
+    TreeNodeIndex             globNumNodes = globDispl[myRank + 1] - globDispl[myRank];
+    std::span<const unsigned> gLeafQLoc(gCounts.data() + globDispl[myRank], globNumNodes);
+    std::vector<unsigned>     globQ(gOctree.numNodes);
+    globalUpsweep<unsigned>(gOctree, globDispl, nodeOwner, gLeafQLoc, std::span<unsigned>(globQ), myRank,
+                            MPI_COMM_WORLD, upsweep);
 
     //! check
     int numGlobErrors = 0;
@@ -133,20 +104,13 @@ int main(int argc, char** argv)
         if (ownedOrChildOfOwned && globQ[i] != globQRef[i]) { ++numGlobErrors; }
     }
 
-    int numLetErrors = 0;
-    for (std::size_t i = 0; i < letQ.size(); ++i)
-    {
-        if (letQ[i] != letQRef[i]) { ++numLetErrors; }
-    }
-
     MPI_Allreduce(MPI_IN_PLACE, &numGlobErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, &numLetErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     if (myRank == 0)
     {
-        std::printf("upsweep (%ld far leaves): %s (%d errors)\n", farLeaves.size(), numGlobErrors == 0 ? "PASS" : "FAIL", numGlobErrors);
-        std::printf("LET (%ld far leaves):     %s (%d errors)\n", farLeaves.size(), numLetErrors == 0 ? "PASS" : "FAIL", numLetErrors);
+        std::printf("upsweep (%d global nodes): %s (%d errors)\n", gOctree.numNodes, numGlobErrors == 0 ? "PASS" : "FAIL",
+                    numGlobErrors);
     }
 
     MPI_Finalize();
-    return numGlobErrors != 0 || numLetErrors != 0;
+    return numGlobErrors != 0;
 }
