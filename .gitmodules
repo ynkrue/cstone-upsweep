@@ -1,3 +1,7 @@
 [submodule "extern/sphexa"]
 	path = extern/sphexa
 	url = https://github.com/sphexa-org/sphexa.git
+[submodule "extern/gromacs"]
+	path = extern/gromacs
+	url = git@github.com:fthaler/gromacs.git
+	branch = gromacs-exafmm
