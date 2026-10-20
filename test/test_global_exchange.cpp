@@ -1,14 +1,14 @@
 /*! @file
  * @brief test globalUpsweep against a single-rank upsweep of the global tree
  *
- * Usage: test_global_exchange [L=4] [n=4]
+ * Usage: test_global_exchange [L=3] [n=32] [theta=1.0]
  */
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <random>
+#include <numeric>
 #include <vector>
 
 #include <mpi.h>
@@ -32,44 +32,17 @@ int main(int argc, char** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-    int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 3; // L, 8^L global leaves
-    unsigned numPerCell = argc > 2 ? std::atoi(argv[2]) : 4; // particles per leaf
-    float    theta      = argc > 3 ? std::atof(argv[3]) : 1.0; // MAC opening angle
-    unsigned bucketSize = 4 * numPerCell;                    // n <= bucketSize < 8n
-
+    int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 3;      // L, 8^L global leaves
+    unsigned numPerCell = argc > 2 ? std::atoi(argv[2]) : 32;     // particles per global leaf
+    float    theta      = argc > 3 ? std::atof(argv[3]) : 1.0;
     cstone::Box<T> box(0, 1);
 
-    //! particles: n per cell of the 2^L grid
-    int                               cellsPerDim  = 1 << numLevels;
-    std::size_t                       numParticles = std::size_t(cellsPerDim) * cellsPerDim * cellsPerDim * numPerCell;
-    std::vector<T>                    x(numParticles), y(numParticles), z(numParticles);
-    std::mt19937                      gen(42);
-    std::uniform_real_distribution<T> uniform(0.0, 1.0);
-
-    std::size_t idx = 0;
-    for (int ix = 0; ix < cellsPerDim; ++ix)
-    {
-        for (int iy = 0; iy < cellsPerDim; ++iy)
-        {
-            for (int iz = 0; iz < cellsPerDim; ++iz)
-            {
-                for (unsigned k = 0; k < numPerCell; ++k)
-                {
-                    x[idx] = (ix + uniform(gen)) / cellsPerDim;
-                    y[idx] = (iy + uniform(gen)) / cellsPerDim;
-                    z[idx] = (iz + uniform(gen)) / cellsPerDim;
-                    ++idx;
-                }
-            }
-        }
-    }
-
-    std::vector<KeyType> keys(numParticles);
-    cstone::computeSfcKeys(x.data(), y.data(), z.data(), cstone::sfcKindPointer(keys.data()), numParticles, box);
-    std::sort(keys.begin(), keys.end());
+    //! regular global tree with L levels
+    std::vector<KeyType> gLeaves = cstone::makeNLevelGrid<KeyType>(numLevels);
+    gLeaves.push_back(cstone::nodeRange<KeyType>(0));
+    std::vector<unsigned> gCounts(cstone::nNodes(gLeaves), numPerCell);
 
     //! global tree, distributed across ranks
-    auto [gLeaves, gCounts] = cstone::computeOctree<KeyType>(keys, bucketSize);
     cstone::OctreeData<KeyType, cstone::execution::Cpu> globalTree;
     globalTree.resize(cstone::nNodes(gLeaves));
     cstone::updateInternalTree<KeyType>(gLeaves, globalTree.data());
@@ -79,98 +52,81 @@ int main(int argc, char** argv)
     auto                           assignment = cstone::makeSfcAssignment(numRanks, gCounts, gLeaves.data());
     std::span<const TreeNodeIndex> globDispl  = assignment.treeOffsetsConst();
 
+    //! leaf quantity with distinct values
+    std::vector<unsigned> gLeafQ(cstone::nNodes(gLeaves));
+    std::iota(gLeafQ.begin(), gLeafQ.end(), 1u);
+
     auto upsweep = [](auto levelRange, auto childOffsets, auto Q)
     { cstone::upsweep(levelRange, childOffsets, Q, cstone::NodeCount<unsigned>{}); };
 
-    //! reference: upsweep of all global leaves on one rank
+    //! reference upsweep of all global leaves
     std::vector<unsigned> globQRef(gOctree.numNodes);
-    cstone::scatter(gOctree.leafToInternalSpan(), gCounts.data(), globQRef.data());
+    cstone::scatter(gOctree.leafToInternalSpan(), gLeafQ.data(), globQRef.data());
     upsweep(gOctree.levelRangeSpan(), gOctree.childOffsets, globQRef.data());
 
-    //! point-to-point upsweep of the global tree, Q = particle counts of my global leaves
+    //! compute node owners and exchange lists
     std::vector<int> nodeOwner = computeNodeOwners(gOctree, assignment);
+    // UpsweepLists upSweepLists =
+    //     computeMacLists(gOctree, std::span<const KeyType>(gLeaves), globDispl, std::span<const int>(nodeOwner), box,
+    //                     cstone::invThetaMinMac(theta), myRank);
+    UpsweepLists upSweepLists = computeOverlapLists(gOctree, globDispl, std::span<const int>(nodeOwner), myRank);
 
-    UpsweepLists lists = computeUpsweepLists(gOctree, std::span<const KeyType>(gLeaves), globDispl,
-                                             std::span<const int>(nodeOwner), box, cstone::invThetaMinMac(theta), myRank);
-
-    //! debug: lists of one rank, compare with the atlas (L=3, P=3, theta=1, view as rank 1)
-    if (myRank == 1)
+    //! check recv lists via the ancestors of my leaves
+    //  expected: c is not mine and parent(c) is an ancestor of one of my leaves
+    auto parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
+    std::vector<char> overlapsMe(gOctree.numNodes, 0);
+    for (TreeNodeIndex i = globDispl[myRank]; i < globDispl[myRank + 1]; ++i) // walk through my leaves
     {
-        for (std::size_t l = 0; l < lists.recv.size(); ++l)
-        {
-            for (auto m : lists.recv[l])
-            {
-                std::printf("recv l=%zu peer=%d count=%d nodes %d..%d\n", l, m.peer, m.count,
-                            lists.recvIdx[m.offset], lists.recvIdx[m.offset + m.count - 1]);
-            }
-            for (auto m : lists.send[l])
-            {
-                std::printf("send l=%zu peer=%d count=%d nodes %d..%d\n", l, m.peer, m.count,
-                            lists.sendIdx[m.offset], lists.sendIdx[m.offset + m.count - 1]);
-            }
+        for (TreeNodeIndex n = gOctree.leafToInternalSpan()[i]; n != 0; n = parent(n)) // walk trough ancestors
+        { 
+            overlapsMe[parent(n)] = 1;
         }
     }
-
-    //! check: per level, every send message matches the receiver's recv message (count, node indices, order)
-    int numListErrors = 0;
-    for (std::size_t l = 0; l < lists.recv.size(); ++l)
+    int numSetErrors = 0;
+    std::vector<char> inRecv(gOctree.numNodes, 0);
+    for (TreeNodeIndex c : upSweepLists.recvIdx)
     {
-        //! (a) counts per pair: what each peer sends me vs. what my recv list expects
-        std::vector<int> sendCounts(numRanks, 0), recvCounts(numRanks, 0), expected(numRanks, 0);
-        for (auto m : lists.send[l]) { sendCounts[m.peer] = m.count; }
-        for (auto m : lists.recv[l]) { expected[m.peer] = m.count; }
-        MPI_Alltoall(sendCounts.data(), 1, MPI_INT, recvCounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
-        int countErrors = 0;
-        for (int r = 0; r < numRanks; ++r) { countErrors += recvCounts[r] != expected[r]; }
-        numListErrors += countErrors;
-        int anyCountErrors = countErrors;
-        MPI_Allreduce(MPI_IN_PLACE, &anyCountErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-        if (anyCountErrors) { continue; } // exchanging indices with mismatched counts could hang
-
-        //! (b) node indices: the sender's sendIdx slice must equal my recvIdx slice
-        std::vector<TreeNodeIndex> got(lists.recvIdx.size());
-        std::vector<MPI_Request>   requests;
-        for (auto m : lists.recv[l])
-        {
-            MPI_Irecv(got.data() + m.offset, m.count, MPI_INT, m.peer, int(l), MPI_COMM_WORLD, &requests.emplace_back());
-        }
-        for (auto m : lists.send[l])
-        {
-            MPI_Isend(lists.sendIdx.data() + m.offset, m.count, MPI_INT, m.peer, int(l), MPI_COMM_WORLD,
-                      &requests.emplace_back());
-        }
-        MPI_Waitall(int(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
-        for (auto m : lists.recv[l])
-        {
-            for (TreeNodeIndex i = m.offset; i < m.offset + m.count; ++i) { numListErrors += got[i] != lists.recvIdx[i]; }
-        }
+        numSetErrors += inRecv[c]; // check duplicates
+        inRecv[c] = 1;
     }
-    MPI_Allreduce(MPI_IN_PLACE, &numListErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    if (myRank == 0) { std::printf("lists send/recv match: %s (%d errors)\n", numListErrors == 0 ? "PASS" : "FAIL", numListErrors); }
+    for (TreeNodeIndex c = 0; c < gOctree.numNodes; ++c) // check if each node is expected
+    {
+        bool expected = c > 0 && overlapsMe[parent(c)] && nodeOwner[c] != myRank;
+        if (expected != bool(inRecv[c])) { ++numSetErrors; }
+    }
 
-    // TreeNodeIndex             globNumNodes = globDispl[myRank + 1] - globDispl[myRank];
-    // std::span<const unsigned> gLeafQLoc(gCounts.data() + globDispl[myRank], globNumNodes);
-    // std::vector<unsigned>     globQ(gOctree.numNodes);
-    // globalUpsweep<unsigned>(gOctree, globDispl, nodeOwner, gLeafQLoc, std::span<unsigned>(globQ), myRank,
-    //                         MPI_COMM_WORLD, upsweep);
+    MPI_Allreduce(MPI_IN_PLACE, &numSetErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (myRank == 0)
+    {
+        std::printf("recv list: %s (%d errors)\n", numSetErrors == 0 ? "PASS" : "FAIL", numSetErrors);
+    }
 
-    // //! check
-    // int numGlobErrors = 0;
-    // for (TreeNodeIndex i = 0; i < gOctree.numNodes; ++i)
-    // {
-    //     bool ownedOrChildOfOwned =
-    //         nodeOwner[i] == myRank || (i > 0 && nodeOwner[gOctree.parents[(i - 1) / 8]] == myRank);
-    //     if (ownedOrChildOfOwned && globQ[i] != globQRef[i]) { ++numGlobErrors; }
-    // }
+    //! point-to-point upsweep
+    TreeNodeIndex             globNumNodes = globDispl[myRank + 1] - globDispl[myRank];
+    std::span<const unsigned> gLeafQLoc(gLeafQ.data() + globDispl[myRank], globNumNodes);
+    std::vector<unsigned>     globQ(gOctree.numNodes);
+    cstone::scatter(gOctree.leafToInternalSpan().subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(), globQ.data());
+    globalUpsweep(gOctree, upSweepLists, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
 
-    // MPI_Allreduce(MPI_IN_PLACE, &numGlobErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    // if (myRank == 0)
-    // {
-    //     std::printf("upsweep (%d global nodes): %s (%d errors)\n", gOctree.numNodes, numGlobErrors == 0 ? "PASS" : "FAIL",
-    //                 numGlobErrors);
-    // }
+    //! check: every node I own or receive equals the single-rank reference
+    std::vector<char> held(gOctree.numNodes, 0);
+    for (TreeNodeIndex i = 0; i < gOctree.numNodes; ++i) { held[i] = nodeOwner[i] == myRank; }
+    for (TreeNodeIndex i : upSweepLists.recvIdx) { held[i] = 1; }
+
+    int numGlobErrors = 0, numHeld = 0;
+    for (TreeNodeIndex i = 0; i < gOctree.numNodes; ++i)
+    {
+        numHeld += held[i];
+        if (held[i] && globQ[i] != globQRef[i]) { ++numGlobErrors; }
+    }
+    std::printf("rank %d holds %d of %d global nodes\n", myRank, numHeld, gOctree.numNodes);
+
+    MPI_Allreduce(MPI_IN_PLACE, &numGlobErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (myRank == 0)
+    {
+        std::printf("upsweep: %s (%d errors)\n", numGlobErrors == 0 ? "PASS" : "FAIL", numGlobErrors);
+    }
 
     MPI_Finalize();
-    return 0;
-    // return numGlobErrors != 0;
+    return numGlobErrors != 0 || numSetErrors != 0;
 }
