@@ -6,15 +6,12 @@
 
 #include <cstdint>
 #include <span>
-#include <utility>
 #include <vector>
-#include <algorithm>
 
 #include <mpi.h>
 
 #include "cstone/sfc/common.hpp"
 #include "cstone/domain/domaindecomp.hpp"
-#include "cstone/focus/source_center.hpp"
 #include "cstone/primitives/gather.hpp"
 #include "cstone/primitives/mpi_wrappers.hpp"
 #include "cstone/tree/octree.hpp"
@@ -24,8 +21,10 @@ namespace upsweep_p2p
 
 using namespace cstone;
 
-// MPI Tag
-constexpr int upsweepTag = 6500;
+// MPI tags
+constexpr int upsweepTag   = 6500;
+constexpr int requestTag   = 6600;
+constexpr int downsweepTag = 6700;
 
 /*! @brief owner rank of every global tree node: the rank holding the node's first leaf
  *
@@ -45,12 +44,12 @@ std::vector<int> computeNodeOwners(OctreeView<const KeyType> gOctree, const csto
     return owner;
 }
 
-/*! @brief send/recv lists of the upsweep per parent level
+/*! @brief send/recv lists of one sweep (up or down) per parent level
  *
  * Message m covers the node indices sendIdx/recvIdx[m.offset : m.offset + m.count],
- * grouped by level, then by peer
+ * the messages of one level are contiguous
  */
-struct UpsweepLists
+struct SweepLists
 {
     struct Message
     {
@@ -61,201 +60,196 @@ struct UpsweepLists
     std::vector<TreeNodeIndex>        sendIdx, recvIdx;
 };
 
-/*! @brief send/recv lists of the upsweep on a regular global tree: children of all parents that overlap the receiver
+//! @brief append node i for @p peer, consecutive nodes with the same peer extend the last message
+inline void addNode(std::vector<SweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer, TreeNodeIndex i)
+{
+    if (msgs.empty() || msgs.back().peer != peer) { msgs.push_back({peer, TreeNodeIndex(idx.size()), 0}); }
+    idx.push_back(i);
+    msgs.back().count++;
+}
+
+/*! @brief upsweep lists between siblings: children 1-7 go to the owner of child 0, which owns the parent
  *
- * @param[in] gOctree  global octree, same on all ranks, regular
+ * @param[in] gOctree  global octree, same on all ranks
  * @return             send/recv lists per parent level
- * 
- * Regular tree: all global leaves on level L, so parent j of level l covers the global leaves [j * span, (j+1) * span)
- * with span = 8^(L-l). The parents overlapping a rank are then one index range per level.
+ *
+ * A rank sends to at most one parent per level: the one that contains its first leaf.
  */
 template<class KeyType>
-UpsweepLists computeOverlapLists(OctreeView<const KeyType> gOctree,
-                                 std::span<const TreeNodeIndex> globDispl_, // becomes member
-                                 std::span<const int>           nodeOwner_, // becomes member
-                                 int                            myRank_)    // becomes member
+SweepLists computeUpsweepLists(OctreeView<const KeyType> gOctree,
+                               std::span<const int> nodeOwner_, // becomes member
+                               int                  myRank_)    // becomes member
 {
     auto levelRange = gOctree.levelRangeSpan();
     int  numLevels  = maxDepth(levelRange.data(), levelRange.size()); // L
-    auto leafOwner  = nodeOwner_.subspan(levelRange[numLevels]);      // owner of global leaf i
 
-    UpsweepLists lists;
-    lists.send.resize(numLevels);
-    lists.recv.resize(numLevels);
-
-    //! consecutive nodes with the same peer extend the last message
-    auto addNode = [](std::vector<UpsweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer, TreeNodeIndex c)
-    {
-        if (msgs.empty() || msgs.back().peer != peer) { msgs.push_back({peer, TreeNodeIndex(idx.size()), 0}); }
-        idx.push_back(c);
-        msgs.back().count++;
-    };
-
-    TreeNodeIndex myFirstLeaf = globDispl_[myRank_], myEndLeaf = globDispl_[myRank_ + 1];
-    if (myFirstLeaf == myEndLeaf) { return lists; } // no leaves: overlaps nothing, owns nothing
+    SweepLists up;
+    up.send.resize(numLevels);
+    up.recv.resize(numLevels);
 
     for (int l = 0; l < numLevels; ++l)
     {
-        TreeNodeIndex span   = TreeNodeIndex(1) << 3 * (numLevels - l); // global leaves per parent
-        TreeNodeIndex jFirst = myFirstLeaf / span, jLast = (myEndLeaf - 1) / span; // parents overlapping me
-        auto children = [&](TreeNodeIndex j) { return levelRange[l + 1] + 8 * j; }; // first child of parent j
-
-        //! recv: children of the parents overlapping me, except mine
-        for (TreeNodeIndex c = children(jFirst); c < children(jLast + 1); ++c)
+        for (TreeNodeIndex i = levelRange[l]; i < levelRange[l + 1]; ++i) // parents of level l
         {
-            if (nodeOwner_[c] != myRank_) { addNode(lists.recv[l], lists.recvIdx, nodeOwner_[c], c); }
-        }
-
-        //! send: my children to every other rank q overlapping their parent, one rank after the other
-        int qFirst = leafOwner[jFirst * span], qLast = leafOwner[(jLast + 1) * span - 1];
-        for (int q = qFirst; q <= qLast; ++q)
-        {
-            if (q == myRank_ || globDispl_[q] == globDispl_[q + 1]) { continue; }
-            //! parents overlapping both me and q
-            TreeNodeIndex qjFirst = std::max(jFirst, globDispl_[q] / span);
-            TreeNodeIndex qjLast  = std::min(jLast, (globDispl_[q + 1] - 1) / span);
-            for (TreeNodeIndex c = children(qjFirst); c < children(qjLast + 1); ++c)
+            TreeNodeIndex firstChild = gOctree.childOffsets[i];
+            for (TreeNodeIndex c = firstChild + 1; c < firstChild + 8; ++c) // child 0 has the parent's owner
             {
-                if (nodeOwner_[c] == myRank_) { addNode(lists.send[l], lists.sendIdx, q, c); }
+                if (nodeOwner_[c] == nodeOwner_[i]) { continue; }
+                if (nodeOwner_[c] == myRank_) { addNode(up.send[l], up.sendIdx, nodeOwner_[i], c); }
+                if (nodeOwner_[i] == myRank_) { addNode(up.recv[l], up.recvIdx, nodeOwner_[c], c); }
             }
         }
     }
-
-    return lists;
+    return up;
 }
 
-/*! @brief send/recv lists of the upsweep
- *
- * @param[in]  gOctree      global octree, same on all ranks
- * @param[in]  gLeaves      global leaf keys, length gOctree.numLeafNodes + 1
- * @param[in]  invThetaEff  minMAC parameter, invThetaMinMac(theta) = 1/theta + 0.5
- * @return                  send/recv lists per parent level, becomes member: upsweepLists_
- */
-template<class KeyType, class T>
-UpsweepLists computeMacLists(OctreeView<const KeyType> gOctree, std::span<const KeyType> gLeaves,
-                                 std::span<const TreeNodeIndex> globDispl_, // becomes member
-                                 std::span<const int>           nodeOwner_, // becomes member
-                                 const Box<T>&                  box_,       // becomes member
-                                 float                          invThetaEff,
-                                 int                            myRank_) // becomes member
+//! @brief exchange the values of one level: send globQ[sendIdx], receive into globQ[recvIdx]
+template<class Q>
+void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, MPI_Comm comm)
 {
-    int  numRanks        = int(globDispl_.size()) - 1;
-    auto levelRange      = gOctree.levelRangeSpan();
-    int  numParentLevels = maxDepth(levelRange.data(), levelRange.size());
+    const auto& send = lists.send[l];
+    const auto& recv = lists.recv[l];
 
-    //! compute cell centers and mac flags
-    std::vector<Vec4<T>> centers(gOctree.numNodes);
-    geoMacSpheres(std::span<const KeyType>(gOctree.prefixes, gOctree.numNodes), centers.data(), invThetaEff, box_);
-    std::vector<uint8_t> macs(std::size_t(numRanks) * gOctree.numNodes, 0);
-    for (int r = 0; r < numRanks; ++r)
+    //! the messages of one level are one contiguous slice of sendIdx / recvIdx, starting at sFirst / rFirst
+    auto levelNodes = [](const std::vector<SweepLists::Message>& msgs, const std::vector<TreeNodeIndex>& idx)
     {
-        markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box_,
-                 gLeaves.data() + globDispl_[r], globDispl_[r + 1] - globDispl_[r], false,
-                 macs.data() + std::size_t(r) * gOctree.numNodes);
-    }
-    auto failsMac = [&](int r, TreeNodeIndex p) { return macs[std::size_t(r) * gOctree.numNodes + p] != 0; };
-
-    UpsweepLists lists;
-    lists.send.resize(numParentLevels);
-    lists.recv.resize(numParentLevels);
-
-    //! consecutive nodes with the same peer extend the last message
-    auto addNode = [](std::vector<UpsweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer, TreeNodeIndex c)
-    {
-        if (msgs.empty() || msgs.back().peer != peer) { msgs.push_back({peer, TreeNodeIndex(idx.size()), 0}); } // new message
-        idx.push_back(c);
-        msgs.back().count++;
+        if (msgs.empty()) { return std::span<const TreeNodeIndex>{}; }
+        return std::span<const TreeNodeIndex>(idx).subspan(msgs.front().offset,
+                                                           msgs.back().offset + msgs.back().count - msgs.front().offset);
     };
-    auto parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
+    auto           sendNodes = levelNodes(send, lists.sendIdx), recvNodes = levelNodes(recv, lists.recvIdx);
+    TreeNodeIndex  sFirst = send.empty() ? 0 : send.front().offset, rFirst = recv.empty() ? 0 : recv.front().offset;
+    std::vector<Q> sendBuf(sendNodes.size()), recvBuf(recvNodes.size());
 
-
-    for (int l = 0; l < numParentLevels; ++l)
+    std::vector<MPI_Request> mpiRequests;
+    for (const auto& m : recv)
     {
-        //! children of level-l parents are all nodes of level l + 1
-        TreeNodeIndex firstChild = levelRange[l + 1], lastChild = levelRange[l + 2];
-
-        //! recv: children of parents that fail the MAC for me, from their owner
-        for (TreeNodeIndex c = firstChild; c < lastChild; ++c)
-        {
-            if (nodeOwner_[c] != myRank_ && failsMac(myRank_, parent(c)))
-            {
-                addNode(lists.recv[l], lists.recvIdx, nodeOwner_[c], c);
-            }
-        }
-        //! send: my children of parents that fail the MAC for q
-        for (int q = 0; q < numRanks; ++q)
-        {
-            for (TreeNodeIndex c = firstChild; c < lastChild; ++c)
-            {
-                if (q != myRank_ && nodeOwner_[c] == myRank_ && failsMac(q, parent(c)))
-                {
-                    addNode(lists.send[l], lists.sendIdx, q, c);
-                }
-            }
-        }
+        mpiRecvAsync(recvBuf.data() + m.offset - rFirst, m.count, m.peer, tag, mpiRequests, comm);
     }
-
-    return lists;
+    gather(sendNodes, globQ.data(), sendBuf.data());
+    for (const auto& m : send)
+    {
+        mpiSendAsync(sendBuf.data() + m.offset - sFirst, m.count, m.peer, tag, mpiRequests, comm);
+    }
+    MPI_Waitall(int(mpiRequests.size()), mpiRequests.data(), MPI_STATUSES_IGNORE);
+    scatter(recvNodes, recvBuf.data(), globQ.data());
 }
 
-/*! @brief p2p upsweep of the global tree
+/*! @brief p2p upsweep + downsweep of the global tree
  *
  * @param[in]    gOctree          global octree, same on all ranks
- * @param[in]    lists            send/recv lists, once per tree (computeMacLists)
+ * @param[in]    up               upsweep lists (computeUpsweepLists)
+ * @param[in]    flags_           flags_[i] = 1: I need the 8 children of node i, length numNodes
+ * @param[in]    nodeOwner_       owner rank per node
  * @param[inout] globQ            in: my global leaf quantities at their node positions
- *                                out: valid for nodes I own and nodes in lists.recvIdx
+ *                                out: valid for the nodes I own and the children of my flagged nodes
  * @param[in]    comm             MPI communicator
  * @param[in]    upsweepFunction  upsweep of one level
  * @param[in]    upsweepArgs      extra upsweep arguments, e.g. expansion centers
+ *
+ * Upsweep: with the values, each rank sends a request on its pair: the flagged nodes it doesn't own, plus the
+ * requests from below that it can't answer itself. The answers (children of the requested nodes) form the
+ * downsweep lists. Downsweep: the same exchange with those lists, root first.
+ * Assumes overlap flags: all flagged nodes lie on the path from my first leaf to the root, like my pair parents.
  */
 template<class Q, class KeyType, class F, class... UArgs>
-void globalUpsweep(cstone::OctreeView<const KeyType> gOctree, const UpsweepLists& lists,
-                   std::span<Q> globQ, MPI_Comm comm, F&& upsweepFunction, UArgs&&... upsweepArgs)
+void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
+                   const SweepLists&                 up,         // becomes member
+                   std::span<const uint8_t>          flags_,     // becomes member
+                   std::span<const int>              nodeOwner_, // becomes member
+                   std::span<Q>                      globQ,
+                   MPI_Comm                          comm,
+                   F&&                               upsweepFunction,
+                   UArgs&&... upsweepArgs)
 {
-    auto levelRange     = gOctree.levelRangeSpan();
-    int numParentLevels = int(lists.send.size());
+    int myRank;
+    MPI_Comm_rank(comm, &myRank);
+    auto levelRange      = gOctree.levelRangeSpan();
+    int  numParentLevels = int(up.send.size());
+    auto parent          = [&](TreeNodeIndex i) { return gOctree.parents[(i - 1) / 8]; };
 
-    //! buffers indexed like sendIdx / recvIdx
-    std::vector<Q> sendBuf(lists.sendIdx.size()), recvBuf(lists.recvIdx.size());
-
-    //! the messages of one level are one contiguous slice of sendIdx / recvIdx: (first, count)
-    auto levelSlice = [](const std::vector<UpsweepLists::Message>& msgs)
+    //! nodes whose children I need, don't compute myself and haven't requested yet
+    std::vector<uint8_t> pending(gOctree.numNodes, 0);
+    for (TreeNodeIndex i = 0; i < gOctree.numInternalNodes; ++i)
     {
-        if (msgs.empty()) { return std::pair<TreeNodeIndex, TreeNodeIndex>{0, 0}; }
-        return std::pair<TreeNodeIndex, TreeNodeIndex>{msgs.front().offset,
-                                                       msgs.back().offset + msgs.back().count - msgs.front().offset};
+        if (flags_[i] && nodeOwner_[i] != myRank) { pending[i] = 1; }
+    }
+
+    //! downsweep lists, filled during the upsweep: children of each requested node, minus those the requester owns
+    SweepLists down;
+    down.send.resize(numParentLevels);
+    down.recv.resize(numParentLevels);
+    auto addChildren = [&](std::vector<SweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer,
+                           std::span<const TreeNodeIndex> nodes, int requester)
+    {
+        for (TreeNodeIndex i : nodes)
+        {
+            if (i < 0) { continue; } // empty request slot
+            TreeNodeIndex firstChild = gOctree.childOffsets[i];
+            for (TreeNodeIndex c = firstChild; c < firstChild + 8; ++c)
+            {
+                if (nodeOwner_[c] != requester) { addNode(msgs, idx, peer, c); }
+            }
+        }
     };
 
-    //! Exchange messages per level
+    //! upsweep, deepest level first: request + values on the same pair
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
-        std::vector<MPI_Request> requests;
-        int tag = upsweepTag + l;
-        const auto& send = lists.send[l];
-        const auto& recv = lists.recv[l];
-
-        // receive values
-        for (const auto& m : recv)
+        // requests have a fixed size: one slot per level, -1 = empty
+        std::vector<MPI_Request>   mpiRequests;
+        std::vector<TreeNodeIndex> peerRequests(up.recv[l].size() * numParentLevels);
+        for (size_t k = 0; k < up.recv[l].size(); ++k)
         {
-            mpiRecvAsync(recvBuf.data() + m.offset, m.count, m.peer, tag, requests, comm);
+            mpiRecvAsync(peerRequests.data() + k * numParentLevels, numParentLevels, up.recv[l][k].peer, requestTag + l,
+                         mpiRequests, comm);
         }
 
-        // pack the whole level once, then send each message
-        auto [sFirst, sCount] = levelSlice(send);
-        gather(std::span<const TreeNodeIndex>(lists.sendIdx).subspan(sFirst, sCount), globQ.data(), sendBuf.data() + sFirst);
-        for (const auto& m : send)
+        // my request: walk up from my pair's parent and take the pending nodes, stop where the level above has its
+        // own pair. Each node goes on the topmost pair below it, so the peer holds its children in time
+        std::vector<TreeNodeIndex> myRequest(numParentLevels, -1);
+        for (const auto& m : up.send[l]) // at most one pair per level
         {
-            mpiSendAsync(sendBuf.data() + m.offset, m.count, m.peer, tag, requests, comm);
+            TreeNodeIndex i     = parent(up.sendIdx[m.offset]);
+            int           level = l; // level of node i
+            while (true)
+            {
+                if (pending[i])
+                {
+                    myRequest[level] = i;
+                    pending[i]       = 0;
+                }
+                if (level == 0 || !up.send[level - 1].empty()) { break; }
+                i = parent(i);
+                --level;
+            }
+            mpiSendAsync(myRequest.data(), myRequest.size(), m.peer, requestTag + l, mpiRequests, comm);
+            addChildren(down.recv[l], down.recvIdx, m.peer, myRequest, myRank);
         }
-        MPI_Waitall(int(requests.size()), requests.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(int(mpiRequests.size()), mpiRequests.data(), MPI_STATUSES_IGNORE);
 
-        // unpack the whole level once
-        auto [rFirst, rCount] = levelSlice(recv);
-        scatter(std::span<const TreeNodeIndex>(lists.recvIdx).subspan(rFirst, rCount), recvBuf.data() + rFirst,
-                globQ.data());
+        // requests of my peers: answer them in the downsweep, ask further up for the nodes I don't own
+        for (size_t k = 0; k < up.recv[l].size(); ++k)
+        {
+            int                            peer = up.recv[l][k].peer;
+            std::span<const TreeNodeIndex> nodes(peerRequests.data() + k * numParentLevels, numParentLevels);
+            addChildren(down.send[l], down.sendIdx, peer, nodes, peer);
+            for (TreeNodeIndex i : nodes)
+            {
+                if (i >= 0 && nodeOwner_[i] != myRank) { pending[i] = 1; }
+            }
+        }
+
+        exchangeLevel(up, l, upsweepTag + l, globQ, comm);
 
         //! compute the parents of level l from their children
         upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data(), upsweepArgs...);
+    }
+
+    //! downsweep, root first: send the answers
+    for (int l = 0; l < numParentLevels; ++l)
+    {
+        exchangeLevel(down, l, downsweepTag + l, globQ, comm);
     }
 }
 
