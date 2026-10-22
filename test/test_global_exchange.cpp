@@ -61,9 +61,8 @@ int main(int argc, char** argv)
     cstone::scatter(gOctree.leafToInternalSpan(), gLeafQ.data(), globQRef.data());
     upsweep(gOctree.levelRangeSpan(), gOctree.childOffsets, globQRef.data());
 
-    //! node owners and upsweep lists
-    std::vector<int> nodeOwner = computeNodeOwners(gOctree, assignment);
-    SweepLists       upLists   = computeUpsweepLists(gOctree, std::span<const int>(nodeOwner), myRank);
+    //! upsweep lists
+    SweepLists upLists = computeUpsweepLists(gOctree, assignment, myRank);
 
     //! flags, overlap case: the ancestors of my leaves
     auto                 parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
@@ -81,13 +80,13 @@ int main(int argc, char** argv)
     std::span<const unsigned> gLeafQLoc(gLeafQ.data() + globDispl[myRank], globNumNodes);
     std::vector<unsigned>     globQ(gOctree.numNodes);
     cstone::scatter(gOctree.leafToInternalSpan().subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(), globQ.data());
-    globalUpsweep(gOctree, upLists, flags, nodeOwner, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
+    globalUpsweep(gOctree, upLists, flags, assignment, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
 
     //! check: every node I own and every child of a flagged node equals the single-rank reference
     int numErrors = 0, numHeld = 0;
     for (TreeNodeIndex i = 0; i < gOctree.numNodes; ++i)
     {
-        bool held = nodeOwner[i] == myRank || (i > 0 && flags[parent(i)]);
+        bool held = nodeOwner(gOctree, assignment, i) == myRank || (i > 0 && flags[parent(i)]);
         numHeld += held;
         if (held && globQ[i] != globQRef[i]) { ++numErrors; }
     }
