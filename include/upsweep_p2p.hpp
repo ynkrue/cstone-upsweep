@@ -5,6 +5,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -28,6 +29,15 @@ constexpr int requestUpTag   = 6600;
 constexpr int downsweepTag   = 6700;
 constexpr int requestDownTag = 6800;
 constexpr int upFlaggedTag   = 6900;
+
+//! TEMPORARY profiling: accumulated times [s], reset by the caller
+struct ProfileTimes
+{
+    double reqStart = 0, reqUpWait = 0, reqUp = 0, reqDownWait = 0, reqDown = 0; // computeExchangeLists
+    double upEx = 0, upCompute = 0, upFlaggedEx = 0, downEx = 0;                 // globalUpsweep
+    double exWait = 0;                                                           // Waitall in exchangeLevel
+};
+inline ProfileTimes profile;
 
 /*! @brief owner rank of global node i: the rank holding the node's first leaf
  *
@@ -64,12 +74,17 @@ inline void addNode(std::vector<SweepLists::Message>& msgs, std::vector<TreeNode
     msgs.back().count++;
 }
 
-//! @brief exchange the values of one level: send globQ[sendIdx], receive into globQ[recvIdx]
+/*! @brief exchange the values of one level: send globQ[sendIdx], receive into globQ[recvIdx]
+ *
+ * With @p childOffsets, each index i stands for the 8 children of i, sent in octant order.
+ */
 template<class Q>
-void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, MPI_Comm comm)
+void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, MPI_Comm comm,
+                   const TreeNodeIndex* childOffsets = nullptr)
 {
-    const auto& send = lists.send[l];
-    const auto& recv = lists.recv[l];
+    int         stride = childOffsets ? 8 : 1;
+    const auto& send   = lists.send[l];
+    const auto& recv   = lists.recv[l];
 
     //! the messages of one level are one contiguous slice of sendIdx / recvIdx, starting at sFirst / rFirst
     auto levelNodes = [](const std::vector<SweepLists::Message>& msgs, const std::vector<TreeNodeIndex>& idx)
@@ -80,20 +95,42 @@ void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, 
     };
     auto           sendNodes = levelNodes(send, lists.sendIdx), recvNodes = levelNodes(recv, lists.recvIdx);
     TreeNodeIndex  sFirst = send.empty() ? 0 : send.front().offset, rFirst = recv.empty() ? 0 : recv.front().offset;
-    std::vector<Q> sendBuf(sendNodes.size()), recvBuf(recvNodes.size());
+    std::vector<Q> sendBuf(sendNodes.size() * stride), recvBuf(recvNodes.size() * stride);
 
     std::vector<MPI_Request> mpiRequests;
     for (const auto& m : recv)
     {
-        mpiRecvAsync(recvBuf.data() + m.offset - rFirst, m.count, m.peer, tag, mpiRequests, comm);
+        mpiRecvAsync(recvBuf.data() + (m.offset - rFirst) * stride, m.count * stride, m.peer, tag, mpiRequests, comm);
     }
-    gather(sendNodes, globQ.data(), sendBuf.data());
+    if (childOffsets)
+    {
+        for (size_t j = 0; j < sendNodes.size(); ++j)
+        {
+            std::copy_n(globQ.data() + childOffsets[sendNodes[j]], 8, sendBuf.data() + 8 * j);
+        }
+    }
+    else
+    {
+        gather(sendNodes, globQ.data(), sendBuf.data());
+    }
     for (const auto& m : send)
     {
-        mpiSendAsync(sendBuf.data() + m.offset - sFirst, m.count, m.peer, tag, mpiRequests, comm);
+        mpiSendAsync(sendBuf.data() + (m.offset - sFirst) * stride, m.count * stride, m.peer, tag, mpiRequests, comm);
     }
+    double tw = MPI_Wtime();
     MPI_Waitall(int(mpiRequests.size()), mpiRequests.data(), MPI_STATUSES_IGNORE);
-    scatter(recvNodes, recvBuf.data(), globQ.data());
+    profile.exWait += MPI_Wtime() - tw;
+    if (childOffsets)
+    {
+        for (size_t j = 0; j < recvNodes.size(); ++j)
+        {
+            std::copy_n(recvBuf.data() + 8 * j, 8, globQ.data() + childOffsets[recvNodes[j]]);
+        }
+    }
+    else
+    {
+        scatter(recvNodes, recvBuf.data(), globQ.data());
+    }
 }
 
 /*! @brief upsweep lists between siblings: children 1-7 go to the owner of child 0, which owns the parent
@@ -194,12 +231,13 @@ std::pair<SweepLists, SweepLists> computeSweepLists(OctreeView<const KeyType>   
  * @param[in] flags_      rank-local, length numNodes: I need the children of every flagged node
  * @param[in] assignment  SFC key range per rank
  * @param[in] comm        MPI communicator
- * @return                {upFlagged, downFlagged}: children of flagged nodes to send/receive per level in the
- *                        upsweep / downsweep of globalUpsweep
+ * @return                {upFlagged, downFlagged}: flagged nodes whose 8 children are sent/received per level in
+ *                        the upsweep / downsweep of globalUpsweep
  *
- * A request (n, a): I need the children of n, the request is at node a. It climbs from my first leaf until a contains n
- * (up loop), then descends to owner(n) (down loop); it changes rank only on an up pair, or on a reversed one going
- * down. Every hop is recorded in reverse: up hop -> downFlagged, down hop -> upFlagged.
+ * A request for n (I need the children of n) climbs from my first leaf until the current node contains n (up loop),
+ * then descends to owner(n) (down loop). It changes rank only on an up pair, or on a reversed one going down. Locally a
+ * request is moved straight to its next hop and waits in the bucket of that round. Every hop is recorded in reverse:
+ * up hop -> downFlagged, down hop -> upFlagged. Each message is sorted and free of duplicates.
  */
 template<class KeyType>
 std::pair<SweepLists, SweepLists> computeExchangeLists(OctreeView<const KeyType> gOctree, const SweepLists& up,
@@ -215,27 +253,28 @@ std::pair<SweepLists, SweepLists> computeExchangeLists(OctreeView<const KeyType>
     auto owner    = [&](TreeNodeIndex i) { return nodeOwner(gOctree, assignment, i); };
     auto parent   = [&](TreeNodeIndex i) { return gOctree.parents[(i - 1) / 8]; };
     auto level    = [&](TreeNodeIndex i) { return int(decodePrefixLength(gOctree.prefixes[i])) / 3; };
-    auto ancestor = [&](TreeNodeIndex n, int lev) -> TreeNodeIndex
+    auto keyStart = [&](TreeNodeIndex i) { return decodePlaceholderBit(gOctree.prefixes[i]); };
+    //! true if node a is n or an ancestor of n
+    auto contains = [&](TreeNodeIndex a, TreeNodeIndex n)
     {
-        while (level(n) > lev)
-        {
-            n = parent(n);
-        }
-        return n;
+        return level(n) >= level(a) && keyStart(n) >= keyStart(a) &&
+               keyStart(n) < keyStart(a) + nodeRange<KeyType>(level(a));
     };
-    auto contains = [&](TreeNodeIndex a, TreeNodeIndex n) -> bool
-    { return level(n) >= level(a) && ancestor(n, level(a)) == a; };
-    auto addChildren = [&](std::vector<SweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer,
-                           std::span<const TreeNodeIndex> nodes)
+    //! child of a that contains n, a contains n and a != n
+    auto childToward = [&](TreeNodeIndex a, TreeNodeIndex n)
+    { return gOctree.childOffsets[a] + TreeNodeIndex(octalDigit(keyStart(n), level(a) + 1)); };
+    //! one message with @p peer that holds @p nodes
+    auto addMessage = [](std::vector<SweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer,
+                         std::span<const TreeNodeIndex> nodes)
     {
-        for (TreeNodeIndex n : nodes)
-        {
-            TreeNodeIndex firstChild = gOctree.childOffsets[n];
-            for (TreeNodeIndex c = firstChild; c < firstChild + 8; ++c)
-            {
-                addNode(msgs, idx, peer, c);
-            }
-        }
+        if (nodes.empty()) { return; }
+        msgs.push_back({peer, TreeNodeIndex(idx.size()), TreeNodeIndex(nodes.size())});
+        idx.insert(idx.end(), nodes.begin(), nodes.end());
+    };
+    auto sortUnique = [](auto& v)
+    {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
     };
 
     SweepLists upFlagged, downFlagged;
@@ -246,138 +285,138 @@ std::pair<SweepLists, SweepLists> computeExchangeLists(OctreeView<const KeyType>
 
     if (globDispl[myRank] == globDispl[myRank + 1]) { return {upFlagged, downFlagged}; } // empty rank
 
-    //! my requests (n, a): I need the children of n, the request is at node a
-    auto                                                 firstLeaf = gOctree.leafToInternalSpan()[globDispl[myRank]];
-    std::vector<std::pair<TreeNodeIndex, TreeNodeIndex>> upRequests, downRequests;
+    //! buckets per round: n to send up to my up peer, (peer, n) to send down to a child owner
+    std::vector<std::vector<TreeNodeIndex>>                 upSend(numParentLevels);
+    std::vector<std::vector<std::pair<int, TreeNodeIndex>>> downSend(numParentLevels);
+
+    //! from node a (mine, contains n): descend while I own the child, then wait for the hop round level(a)
+    auto descend = [&](TreeNodeIndex n, TreeNodeIndex a)
+    {
+        while (owner(n) != myRank) // owner(n) == me: arrived, I supply the children of n
+        {
+            TreeNodeIndex c = childToward(a, n);
+            if (owner(c) != myRank)
+            {
+                downSend[level(a)].push_back({owner(c), n});
+                return;
+            }
+            a = c;
+        }
+    };
+    //! from node a (mine): climb while I own the parent, then wait for the hop round level(parent); turn at a contains
+    //! n
+    auto climb = [&](TreeNodeIndex n, TreeNodeIndex a)
+    {
+        while (!contains(a, n))
+        {
+            TreeNodeIndex p = parent(a);
+            if (owner(p) != myRank)
+            {
+                upSend[level(p)].push_back(n);
+                return;
+            }
+            a = p;
+        }
+        descend(n, a);
+    };
+
+    double tp0 = MPI_Wtime();
+    //! my requests start at my first leaf
+    TreeNodeIndex firstLeaf = gOctree.leafToInternalSpan()[globDispl[myRank]];
     for (TreeNodeIndex i = 0; i < gOctree.numInternalNodes; ++i)
     {
-        if (flags_[i] && owner(i) != myRank) { upRequests.push_back({i, firstLeaf}); }
+        if (flags_[i] && owner(i) != myRank) { climb(i, firstLeaf); }
     }
 
+    double tp1 = MPI_Wtime();
+    profile.reqStart += tp1 - tp0;
+    double waitUp = 0;
     //! up loop, deepest level first
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
-        std::vector<TreeNodeIndex> sendNodes;
-        for (auto& [n, a] : upRequests)
-        {
-            while (true)
-            {
-                if (contains(a, n))
-                {
-                    downRequests.push_back({n, a}); // turn around
-                    n = -1;
-                    break;
-                }
-
-                // climb one level
-                TreeNodeIndex p = parent(a);
-                if (owner(p) == myRank)
-                {
-                    a = p;
-                    continue;
-                }
-
-                if (level(p) == l) // hop to owner of p
-                {
-                    sendNodes.push_back(n);
-                    n = -1;
-                }
-                break;
-            }
-        }
-        std::erase_if(upRequests, [](const auto& req) { return req.first == -1; });
+        std::vector<TreeNodeIndex>& sendNodes = upSend[l];
+        sortUnique(sendNodes);
 
         std::vector<MPI_Request> mpiRequests;
-        for (const auto& m : up.send[l])
+        for (const auto& m : up.send[l]) // at most one pair per level, sent also when empty
         {
             mpiSendAsync(sendNodes.data(), sendNodes.size(), m.peer, requestUpTag + l, mpiRequests, comm);
-            addChildren(downFlagged.recv[l], downFlagged.recvIdx, m.peer, sendNodes);
+            addMessage(downFlagged.recv[l], downFlagged.recvIdx, m.peer, sendNodes);
         }
         for (const auto& m : up.recv[l])
         {
             MPI_Status status;
+            double     tw = MPI_Wtime();
             MPI_Probe(m.peer, requestUpTag + l, comm, &status);
             int count;
             mpiGetCount<TreeNodeIndex>(&status, &count);
 
             std::vector<TreeNodeIndex> recvBuf(count);
             mpiRecvSync(recvBuf.data(), count, m.peer, requestUpTag + l, MPI_STATUS_IGNORE, comm);
-            addChildren(downFlagged.send[l], downFlagged.sendIdx, m.peer, recvBuf);
-            TreeNodeIndex a = parent(up.recvIdx[m.offset]);
+            waitUp += MPI_Wtime() - tw;
+            addMessage(downFlagged.send[l], downFlagged.sendIdx, m.peer, recvBuf);
+
+            TreeNodeIndex a = parent(up.recvIdx[m.offset]); // all children a peer sends at one level share this parent
             for (TreeNodeIndex n : recvBuf)
             {
-                upRequests.push_back({n, a});
+                climb(n, a);
             }
         }
+        double tw = MPI_Wtime();
         MPI_Waitall(int(mpiRequests.size()), mpiRequests.data(), MPI_STATUSES_IGNORE);
+        waitUp += MPI_Wtime() - tw;
     }
 
-    //! requests received in round 0 are at the root, which contains every node
-    downRequests.insert(downRequests.end(), upRequests.begin(), upRequests.end());
-
+    double tp2 = MPI_Wtime();
+    profile.reqUpWait += waitUp;
+    profile.reqUp += tp2 - tp1 - waitUp;
+    double waitDown = 0;
     //! down loop, root first
     for (int l = 0; l < numParentLevels; ++l)
     {
-        std::vector<std::pair<int, TreeNodeIndex>> sendNodes; // (peer, n)
-        for (auto& [n, a] : downRequests)
-        {
-            while (true)
-            {
-                // arrived: I own n and supply its children
-                if (owner(n) == myRank)
-                {
-                    n = -1;
-                    break;
-                }
-
-                // descend one level, to the child of a that contains n
-                TreeNodeIndex c = ancestor(n, level(a) + 1);
-                if (owner(c) == myRank)
-                {
-                    a = c;
-                    continue;
-                }
-
-                if (level(a) == l) // hop to the owner of c
-                {
-                    sendNodes.push_back({owner(c), n});
-                    n = -1;
-                }
-                break;
-            }
-        }
-        std::erase_if(downRequests, [](const auto& req) { return req.first == -1; });
+        auto& sendPairs = downSend[l];
+        sortUnique(sendPairs); // by peer, then n
 
         //! one message to every child owner of this level, also when empty, the peer probes for it
         std::vector<std::vector<TreeNodeIndex>> sendBufs(up.recv[l].size());
         std::vector<MPI_Request>                mpiRequests;
         for (size_t k = 0; k < up.recv[l].size(); ++k)
         {
-            int peer = up.recv[l][k].peer;
-            for (const auto& [toPeer, n] : sendNodes)
+            int peer      = up.recv[l][k].peer;
+            auto [lo, hi] = std::equal_range(sendPairs.begin(), sendPairs.end(), std::pair{peer, TreeNodeIndex(0)},
+                                             [](const auto& x, const auto& y) { return x.first < y.first; });
+            for (auto it = lo; it != hi; ++it)
             {
-                if (toPeer == peer) { sendBufs[k].push_back(n); }
+                sendBufs[k].push_back(it->second);
             }
             mpiSendAsync(sendBufs[k].data(), sendBufs[k].size(), peer, requestDownTag + l, mpiRequests, comm);
-            addChildren(upFlagged.recv[l], upFlagged.recvIdx, peer, sendBufs[k]);
+            addMessage(upFlagged.recv[l], upFlagged.recvIdx, peer, sendBufs[k]);
         }
         for (const auto& m : up.send[l])
         {
             MPI_Status status;
+            double     tw = MPI_Wtime();
             MPI_Probe(m.peer, requestDownTag + l, comm, &status);
             int count;
             mpiGetCount<TreeNodeIndex>(&status, &count);
 
             std::vector<TreeNodeIndex> recvBuf(count);
             mpiRecvSync(recvBuf.data(), count, m.peer, requestDownTag + l, MPI_STATUS_IGNORE, comm);
-            addChildren(upFlagged.send[l], upFlagged.sendIdx, m.peer, recvBuf);
+            waitDown += MPI_Wtime() - tw;
+            addMessage(upFlagged.send[l], upFlagged.sendIdx, m.peer, recvBuf);
+
+            TreeNodeIndex p = parent(up.sendIdx[m.offset]); // the peer owns p, the n arrive at my child of p
             for (TreeNodeIndex n : recvBuf)
             {
-                downRequests.push_back({n, ancestor(n, l + 1)});
-            } // at my child
+                descend(n, childToward(p, n));
+            }
         }
+        double tw = MPI_Wtime();
         MPI_Waitall(int(mpiRequests.size()), mpiRequests.data(), MPI_STATUSES_IGNORE);
+        waitDown += MPI_Wtime() - tw;
     }
+    profile.reqDownWait += waitDown;
+    profile.reqDown += MPI_Wtime() - tp2 - waitDown;
     return {upFlagged, downFlagged};
 }
 
@@ -401,27 +440,59 @@ void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
                    const SweepLists&                 up,          // becomes member
                    const SweepLists&                 upFlagged,   // becomes member
                    const SweepLists&                 downFlagged, // becomes member
+                   const SfcAssignment<KeyType>&     assignment,  // becomes member
                    std::span<Q> globQ, MPI_Comm comm, F&& upsweepFunction, UArgs&&... upsweepArgs)
 {
+    int myRank;
+    MPI_Comm_rank(comm, &myRank);
     auto levelRange      = gOctree.levelRangeSpan();
     int  numParentLevels = int(up.send.size());
+
+    //! my nodes of level l: within a level the nodes are sorted by key, mine start in [assignment[myRank], +1)
+    auto ownedRange = [&](int l)
+    {
+        auto first = [&](KeyType key) // first node of level l with start key >= key
+        {
+            TreeNodeIndex lo = levelRange[l], hi = levelRange[l + 1];
+            while (lo < hi)
+            {
+                TreeNodeIndex mid = (lo + hi) / 2;
+                if (decodePlaceholderBit(gOctree.prefixes[mid]) < key) { lo = mid + 1; }
+                else
+                {
+                    hi = mid;
+                }
+            }
+            return lo;
+        };
+        return std::array<TreeNodeIndex, 2>{first(assignment[myRank]), first(assignment[myRank + 1])};
+    };
 
     //! upsweep
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
+        double ts0 = MPI_Wtime();
         exchangeLevel(up, l, upsweepTag + l, globQ, comm);
+        double ts1 = MPI_Wtime();
 
-        //! compute the parents Q values
-        upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data(), upsweepArgs...);
+        //! compute the Q values of my parents of this level
+        auto owned = ownedRange(l);
+        upsweepFunction(std::span<const TreeNodeIndex>(owned), gOctree.childOffsets, globQ.data(), upsweepArgs...);
+        double ts2 = MPI_Wtime();
 
-        exchangeLevel(upFlagged, l, upFlaggedTag + l, globQ, comm);
+        exchangeLevel(upFlagged, l, upFlaggedTag + l, globQ, comm, gOctree.childOffsets);
+        profile.upEx += ts1 - ts0;
+        profile.upCompute += ts2 - ts1;
+        profile.upFlaggedEx += MPI_Wtime() - ts2;
     }
 
     //! downsweep
+    double ts3 = MPI_Wtime();
     for (int l = 0; l < numParentLevels; ++l)
     {
-        exchangeLevel(downFlagged, l, downsweepTag + l, globQ, comm);
+        exchangeLevel(downFlagged, l, downsweepTag + l, globQ, comm, gOctree.childOffsets);
     }
+    profile.downEx += MPI_Wtime() - ts3;
 }
 
 } // namespace upsweep_p2p

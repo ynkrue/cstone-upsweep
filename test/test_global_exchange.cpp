@@ -79,6 +79,7 @@ int main(int argc, char** argv)
     std::vector<uint8_t>         flags(gOctree.numNodes);
     SweepLists                   upLists, upFlagged, downFlagged;
     double                       times[4] = {0, 0, 0, 0}; // flags, lists, sweep, allgather [s per call]
+    double                       tUpLists = 0;            // TEMPORARY profiling: computeUpsweepLists
     for (int r = 0; r <= numReps; ++r)
     {
         //! flags: global nodes that fail the minMAC against one of my leaves (stand-in for the LET flags)
@@ -88,13 +89,18 @@ int main(int argc, char** argv)
         std::fill(flags.begin(), flags.end(), 0);
         cstone::markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box,
                          gLeaves.data() + globDispl[myRank], globNumNodes, false, flags.data());
+        MPI_Barrier(MPI_COMM_WORLD); // the stand-in flags are unbalanced, lists must not measure waiting for them
         double t1 = MPI_Wtime();
 
+        if (r == 1) { profile = {}; } // TEMPORARY profiling, call 0 is the warm-up
         upLists                          = computeUpsweepLists(gOctree, assignment, myRank);
+        double tUp                       = MPI_Wtime();
         std::tie(upFlagged, downFlagged) = computeExchangeLists(gOctree, upLists, flags, assignment, MPI_COMM_WORLD);
         double t2                        = MPI_Wtime();
+        if (r > 0) { tUpLists += (tUp - t1) / numReps; }
 
-        globalUpsweep(gOctree, upLists, upFlagged, downFlagged, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
+        globalUpsweep(gOctree, upLists, upFlagged, downFlagged, assignment, std::span<unsigned>(globQ), MPI_COMM_WORLD,
+                      upsweep);
         double t3 = MPI_Wtime();
 
         if (r == 0) { continue; }
@@ -112,6 +118,7 @@ int main(int argc, char** argv)
     std::vector<unsigned> gLeafQAll(gOctree.numLeafNodes), globQAll(gOctree.numNodes);
     for (int r = 0; r <= numReps; ++r)
     {
+        MPI_Barrier(MPI_COMM_WORLD);
         double t0 = MPI_Wtime();
         mpiAllgatherv(gLeafQLoc.data(), globNumNodes, gLeafQAll.data(), globCounts.data(), globDispl.data(),
                       MPI_COMM_WORLD);
@@ -138,6 +145,23 @@ int main(int argc, char** argv)
         std::printf("time [ms] L %d P %d: p2p %.3f (flags %.3f | lists %.3f | sweep %.3f) || allgather %.3f\n",
                     numLevels, numRanks, 1e3 * (times[0] + times[1] + times[2]), 1e3 * times[0], 1e3 * times[1],
                     1e3 * times[2], 1e3 * times[3]);
+    }
+
+    //! TEMPORARY profiling, ms per call, each value max over ranks
+    double prof[11] = {
+        tUpLists,     profile.reqStart,  profile.reqUp,       profile.reqUpWait, profile.reqDown, profile.reqDownWait,
+        profile.upEx, profile.upCompute, profile.upFlaggedEx, profile.downEx,    profile.exWait};
+    for (int k = 1; k < 11; ++k)
+    {
+        prof[k] /= numReps;
+    }
+    MPI_Allreduce(MPI_IN_PLACE, prof, 11, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    if (myRank == 0)
+    {
+        std::printf("profile [ms]: lists (upsweepLists %.3f | start %.3f | up %.3f wait %.3f | down %.3f wait %.3f) "
+                    "sweep (up ex %.3f | compute %.3f | upFlagged ex %.3f | down ex %.3f | ex wait %.3f)\n",
+                    1e3 * prof[0], 1e3 * prof[1], 1e3 * prof[2], 1e3 * prof[3], 1e3 * prof[4], 1e3 * prof[5],
+                    1e3 * prof[6], 1e3 * prof[7], 1e3 * prof[8], 1e3 * prof[9], 1e3 * prof[10]);
     }
 
     MPI_Finalize();
