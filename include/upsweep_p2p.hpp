@@ -35,9 +35,7 @@ constexpr int downsweepTag = 6700;
  */
 template<class KeyType>
 int nodeOwner(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment, TreeNodeIndex i)
-{
-    return assignment.findRank(decodePlaceholderBit(gOctree.prefixes[i]));
-}
+{ return assignment.findRank(decodePlaceholderBit(gOctree.prefixes[i])); }
 
 /*! @brief send/recv lists of one sweep (up or down) per parent level
  *
@@ -63,24 +61,48 @@ inline void addNode(std::vector<SweepLists::Message>& msgs, std::vector<TreeNode
     msgs.back().count++;
 }
 
-/*! @brief upsweep lists between siblings: children 1-7 go to the owner of child 0, which owns the parent
+/*! @brief up and down lists between siblings
  *
  * @param[in] gOctree  global octree, same on all ranks
- * @return             send/recv lists per parent level
+ * @return             {up, down} send/recv lists per parent level
  *
- * Only a parent that contains the first leaf of some rank can have children with different owners, so only the
- * ancestors of the first leaf of each rank are visited.
+ * Up: children 1-7 go to the owner of child 0, which owns the parent.
+ * Down: the same pairs reversed, the parent owner sends back the children of the parent and of the ancestors above,
+ * until the child owner has its next pair.
  */
 template<class KeyType>
-SweepLists computeUpsweepLists(OctreeView<const KeyType>     gOctree,
-                               const SfcAssignment<KeyType>& assignment, // becomes member
-                               int                           myRank_)    // becomes member
+std::pair<SweepLists, SweepLists> computeSweepLists(OctreeView<const KeyType>     gOctree,
+                                                    const SfcAssignment<KeyType>& assignment, // becomes member
+                                                    int                           myRank_)    // becomes member
 {
     auto levelRange = gOctree.levelRangeSpan();
     int  numLevels  = maxDepth(levelRange.data(), levelRange.size()); // L
+    auto globDispl  = assignment.treeOffsetsConst();
     auto parent     = [&](TreeNodeIndex i) { return gOctree.parents[(i - 1) / 8]; };
     auto owner      = [&](TreeNodeIndex i) { return nodeOwner(gOctree, assignment, i); };
-    auto globDispl  = assignment.treeOffsetsConst();
+
+    //! children of i and its ancestors that go back down to the receiver, stop at the receiver's next pair
+    auto addDown = [&](std::vector<SweepLists::Message>& msgs, std::vector<TreeNodeIndex>& idx, int peer, int receiver,
+                       TreeNodeIndex i)
+    {
+        for (TreeNodeIndex n = i;; n = parent(n))
+        {
+            for (TreeNodeIndex ch = gOctree.childOffsets[n]; ch < gOctree.childOffsets[n] + 8; ++ch)
+            {
+                if (owner(ch) != receiver) { addNode(msgs, idx, peer, ch); }
+            }
+            if (n == 0) { break; } // root
+
+            // receiver owns a sibling of n, so it has its own pair one level up
+            TreeNodeIndex firstSibling = gOctree.childOffsets[parent(n)];
+            bool          hasPair      = false;
+            for (TreeNodeIndex s = firstSibling; s < firstSibling + 8; ++s)
+            {
+                hasPair |= owner(s) == receiver;
+            }
+            if (hasPair) { break; }
+        }
+    };
 
     //! ancestors of the first leaf of every rank > 0
     std::vector<TreeNodeIndex> boundaryParents;
@@ -95,9 +117,11 @@ SweepLists computeUpsweepLists(OctreeView<const KeyType>     gOctree,
     std::sort(boundaryParents.begin(), boundaryParents.end());
     boundaryParents.erase(std::unique(boundaryParents.begin(), boundaryParents.end()), boundaryParents.end());
 
-    SweepLists up;
+    SweepLists up, down;
     up.send.resize(numLevels);
     up.recv.resize(numLevels);
+    down.send.resize(numLevels);
+    down.recv.resize(numLevels);
 
     int l = 0; // level of parent i
     for (TreeNodeIndex i : boundaryParents)
@@ -109,11 +133,20 @@ SweepLists computeUpsweepLists(OctreeView<const KeyType>     gOctree,
         {
             int childOwner = owner(c);
             if (childOwner == parentOwner) { continue; }
-            if (childOwner == myRank_) { addNode(up.send[l], up.sendIdx, parentOwner, c); }
-            if (parentOwner == myRank_) { addNode(up.recv[l], up.recvIdx, childOwner, c); }
+            bool firstOfOwner = owner(c - 1) != childOwner; // only the first child of each owner adds the down message
+            if (childOwner == myRank_)
+            {
+                addNode(up.send[l], up.sendIdx, parentOwner, c);
+                if (firstOfOwner) { addDown(down.recv[l], down.recvIdx, parentOwner, childOwner, i); }
+            }
+            if (parentOwner == myRank_)
+            {
+                addNode(up.recv[l], up.recvIdx, childOwner, c);
+                if (firstOfOwner) { addDown(down.send[l], down.sendIdx, childOwner, childOwner, i); }
+            }
         }
     }
-    return up;
+    return {up, down};
 }
 
 //! @brief exchange the values of one level: send globQ[sendIdx], receive into globQ[recvIdx]
@@ -127,8 +160,8 @@ void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, 
     auto levelNodes = [](const std::vector<SweepLists::Message>& msgs, const std::vector<TreeNodeIndex>& idx)
     {
         if (msgs.empty()) { return std::span<const TreeNodeIndex>{}; }
-        return std::span<const TreeNodeIndex>(idx).subspan(msgs.front().offset,
-                                                           msgs.back().offset + msgs.back().count - msgs.front().offset);
+        return std::span<const TreeNodeIndex>(idx).subspan(msgs.front().offset, msgs.back().offset + msgs.back().count -
+                                                                                    msgs.front().offset);
     };
     auto           sendNodes = levelNodes(send, lists.sendIdx), recvNodes = levelNodes(recv, lists.recvIdx);
     TreeNodeIndex  sFirst = send.empty() ? 0 : send.front().offset, rFirst = recv.empty() ? 0 : recv.front().offset;
@@ -158,18 +191,15 @@ void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, 
  * @param[in]    upsweepArgs      extra upsweep arguments, e.g. expansion centers
  *
  * Upsweep: with the values, each rank sends a request on its send/recv-pair: the flagged nodes it doesn't own, plus the
- * requests from below that it can't answer itself. The answers (children of the requested nodes) form the downsweep lists.
- * Downsweep: the same exchange with those lists, root first.
+ * requests from below that it can't answer itself. The answers (children of the requested nodes) form the downsweep
+ * lists. Downsweep: the same exchange with those lists, root first.
  */
 template<class Q, class KeyType, class F, class... UArgs>
 void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
                    const SweepLists&                 up,         // becomes member
                    std::span<const uint8_t>          flags_,     // becomes member
                    const SfcAssignment<KeyType>&     assignment, // becomes member
-                   std::span<Q>                      globQ,
-                   MPI_Comm                          comm,
-                   F&&                               upsweepFunction,
-                   UArgs&&... upsweepArgs)
+                   std::span<Q> globQ, MPI_Comm comm, F&& upsweepFunction, UArgs&&... upsweepArgs)
 {
     int myRank;
     MPI_Comm_rank(comm, &myRank);
@@ -215,7 +245,8 @@ void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
                          mpiRequests, comm);
         }
 
-        // my request: walk up from my pair's parent and take the pending nodes, stop where the level above has its own pair
+        // my request: walk up from my pair's parent and take the pending nodes, stop where the level above has its own
+        // pair
         std::vector<TreeNodeIndex> myRequest(numParentLevels, -1);
         for (const auto& m : up.send[l]) // at most one pair per level
         {

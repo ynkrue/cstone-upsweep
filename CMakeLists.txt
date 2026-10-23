@@ -12,7 +12,7 @@ find_package(OpenMP REQUIRED COMPONENTS CXX)
 
 # cstone is header-only for the CPU path
 add_library(cstone INTERFACE)
-target_include_directories(cstone INTERFACE ${PROJECT_SOURCE_DIR}/extern/sphexa/domain/include)
+target_include_directories(cstone INTERFACE ${PROJECT_SOURCE_DIR}/extern/gromacs/src/external/exafmm/external/cornerstone-octree/include)
 
 add_library(upsweep_p2p INTERFACE)
 target_include_directories(upsweep_p2p INTERFACE ${PROJECT_SOURCE_DIR}/include)
