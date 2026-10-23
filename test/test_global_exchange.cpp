@@ -33,7 +33,7 @@ int main(int argc, char** argv)
 
     int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 3;  // L, 8^L global leaves
     unsigned numPerCell = argc > 2 ? std::atoi(argv[2]) : 32; // particles per global leaf
-    int      numReps    = argc > 3 ? std::atoi(argv[3]) : 10; // timed calls after one warm-up call
+    int      numReps    = argc > 3 ? std::atoi(argv[3]) : 50; // timed calls after one warm-up call
 
     //! regular global tree with L levels
     std::vector<KeyType> gLeaves = cstone::makeNLevelGrid<KeyType>(numLevels);
@@ -84,10 +84,10 @@ int main(int argc, char** argv)
                 flags[parent(n)] = 1;
             }
         }
-        double t1 = MPI_Wtime();
-        auto [upLists, downLists]   = computeSweepLists(gOctree, assignment, myRank);
-        double t2 = MPI_Wtime();
-        globalUpsweep(gOctree, upLists, flags, assignment, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
+        double t1                 = MPI_Wtime();
+        auto [upLists, downLists] = computeSweepLists(gOctree, assignment, myRank);
+        double t2                 = MPI_Wtime();
+        globalUpsweep(gOctree, upLists, downLists, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
         double t3 = MPI_Wtime();
 
         if (r == 0) { continue; }
