@@ -1,7 +1,7 @@
 /*! @file
  * @brief test globalUpsweep against a single-rank upsweep of the global tree
  *
- * Usage: test_global_exchange [L=3] [n=32] [reps=10]
+ * Usage: test_global_exchange [L=3] [n=32] [theta=0] [reps=50]
  */
 
 #include <algorithm>
@@ -14,6 +14,8 @@
 #include <mpi.h>
 
 #include "cstone/domain/domaindecomp.hpp"
+#include "cstone/focus/source_center.hpp"
+#include "cstone/traversal/macs.hpp"
 #include "cstone/sfc/sfc.hpp"
 #include "cstone/tree/cs_util.hpp"
 #include "cstone/tree/csarray.hpp"
@@ -33,7 +35,8 @@ int main(int argc, char** argv)
 
     int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 3;  // L, 8^L global leaves
     unsigned numPerCell = argc > 2 ? std::atoi(argv[2]) : 32; // particles per global leaf
-    int      numReps    = argc > 3 ? std::atoi(argv[3]) : 50; // timed calls after one warm-up call
+    double   theta      = argc > 3 ? std::atof(argv[3]) : 1.1;  // MAC opening angle, 0: overlap flags
+    int      numReps    = argc > 4 ? std::atoi(argv[4]) : 50; // timed calls after one warm-up call
 
     //! regular global tree with L levels
     std::vector<KeyType> gLeaves = cstone::makeNLevelGrid<KeyType>(numLevels);
@@ -69,25 +72,39 @@ int main(int argc, char** argv)
                     globQ.data());
 
     //! p2p per call: flags, lists, upsweep + downsweep; call 0 is the warm-up
-    auto                 parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
-    std::vector<uint8_t> flags(gOctree.numNodes);
-    double               times[4] = {0, 0, 0, 0}; // flags, lists, upsweep, allgather [s per call]
+    auto                              parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
+    std::vector<uint8_t>              flags(gOctree.numNodes);
+    cstone::Box<double>               box(0, 1);
+    std::vector<cstone::Vec4<double>> centers(gOctree.numNodes);
+    double                            times[4] = {0, 0, 0, 0}; // flags, lists, upsweep, allgather [s per call]
     for (int r = 0; r <= numReps; ++r)
     {
-        //! flags, overlap case: the ancestors of my leaves
+        //! flags: nodes that fail the minMAC against one of my leaves, theta 0: the ancestors of my leaves (overlap)
+        MPI_Barrier(MPI_COMM_WORLD);
         double t0 = MPI_Wtime();
         std::fill(flags.begin(), flags.end(), 0);
-        for (TreeNodeIndex i = globDispl[myRank]; i < globDispl[myRank + 1]; ++i) // walk through my leaves
+        if (theta > 0)
         {
-            for (TreeNodeIndex n = gOctree.leafToInternalSpan()[i]; n != 0; n = parent(n)) // walk through ancestors
+            cstone::geoMacSpheres(std::span<const KeyType>(gOctree.prefixes, gOctree.numNodes), centers.data(),
+                                  cstone::invThetaMinMac(theta), box);
+            cstone::markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box,
+                             gLeaves.data() + globDispl[myRank], globNumNodes, false, flags.data());
+        }
+        else
+        {
+            for (TreeNodeIndex i = globDispl[myRank]; i < globDispl[myRank + 1]; ++i) // walk through my leaves
             {
-                flags[parent(n)] = 1;
+                for (TreeNodeIndex n = gOctree.leafToInternalSpan()[i]; n != 0; n = parent(n)) // walk through ancestors
+                {
+                    flags[parent(n)] = 1;
+                }
             }
         }
-        double t1                 = MPI_Wtime();
-        auto [upLists, downLists] = computeSweepLists(gOctree, assignment, myRank);
-        double t2                 = MPI_Wtime();
-        globalUpsweep(gOctree, upLists, downLists, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
+        MPI_Barrier(MPI_COMM_WORLD); // the stand-in flags are unbalanced, the sweep must not measure waiting for them
+        double t1      = MPI_Wtime();
+        auto   upLists = computeSweepLists(gOctree, assignment, myRank);
+        double t2      = MPI_Wtime();
+        globalUpsweep(gOctree, assignment, upLists, flags, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
         double t3 = MPI_Wtime();
 
         if (r == 0) { continue; }
