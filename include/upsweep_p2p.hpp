@@ -23,8 +23,8 @@ namespace upsweep_p2p
 using namespace cstone;
 
 // MPI tags
-constexpr int upsweepTag   = 6500;
-constexpr int downsweepTag = 6600;
+constexpr int upsweepTag   = 6500; // child owner to parent owner
+constexpr int downsweepTag = 6600; // parent owner to child owner
 
 /*! @brief owner rank of global node i: the rank holding the node's first leaf
  *
@@ -65,9 +65,9 @@ inline void addNode(std::vector<SweepLists::Message>& msgs, std::vector<TreeNode
  * @param[in] gOctree  global octree, same on all ranks
  * @return             {up, down} send/recv lists per parent level
  *
- * Up: children 1-7 go to the owner of child 0, which owns the parent.
- * Down: the same pairs reversed, the parent owner sends back the children of the parent and of the ancestors above,
- * until the child owner has its next pair.
+ * Up lists, children 1-7 go to the owner of child 0, which owns the parent.
+ * Down lists, the same pairs reversed, the parent owner sends back the children of the parent and of its ancestors,
+ * until the child owner has its next pair. Overlap flags only, no communication.
  */
 template<class KeyType>
 std::pair<SweepLists, SweepLists> computeSweepLists(OctreeView<const KeyType>     gOctree,
@@ -183,23 +183,23 @@ void exchangeLevel(const SweepLists& lists, int l, int tag, std::span<Q> globQ, 
 /*! @brief p2p upsweep + downsweep of the global tree
  *
  * @param[in]    gOctree          global octree, same on all ranks
+ * @param[in]    up               up lists from computeSweepLists
+ * @param[in]    down             down lists from computeSweepLists
  * @param[inout] globQ            in: my global leaf quantities at their node positions
  *                                out: valid for the nodes I own and the children of my flagged nodes
  * @param[in]    comm             MPI communicator
  * @param[in]    upsweepFunction  upsweep of one level
  * @param[in]    upsweepArgs      extra upsweep arguments, e.g. expansion centers
  *
- * Upsweep: per level the children go to the parent owner, then I compute my parents.
- * Downsweep: per level the down lists from computeSweepLists, root first.
+ * Upsweep per level, up lists to the parent owners, then I compute my parents.
+ * Downsweep per level, down lists to the child owners, root first.
  */
 template<class Q, class KeyType, class F, class... UArgs>
 void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
-                   const SweepLists&                 up,         // becomes member
-                   const SweepLists&                 down,       // becomes member
+                   const SweepLists&                 up,   // becomes member
+                   const SweepLists&                 down, // becomes member
                    std::span<Q> globQ, MPI_Comm comm, F&& upsweepFunction, UArgs&&... upsweepArgs)
 {
-    int myRank;
-    MPI_Comm_rank(comm, &myRank);
     auto levelRange      = gOctree.levelRangeSpan();
     int  numParentLevels = int(up.send.size());
 
