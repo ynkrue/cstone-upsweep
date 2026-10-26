@@ -295,26 +295,73 @@ std::pair<SweepLists, SweepLists> computeFlagLists(OctreeView<const KeyType>    
     return {upFlagged, downFlagged};
 }
 
+/*! @brief merge two lists into one message per level and peer, the nodes of @p a first, then those of @p b
+ *
+ * Sender and receiver merge in the same order, so the merged send and recv lists still match.
+ */
+inline SweepLists mergeLists(const SweepLists& a, const SweepLists& b)
+{
+    using Messages = std::vector<SweepLists::Message>;
+    using Indices  = std::vector<TreeNodeIndex>;
+
+    auto mergeLevel = [](const Messages& aMsgs, const Indices& aIdx, const Messages& bMsgs, const Indices& bIdx,
+                         Messages& msgs, Indices& idx)
+    {
+        //! peers of the level in order of first appearance
+        std::vector<int> peers;
+        for (const auto* src : {&aMsgs, &bMsgs})
+        {
+            for (const auto& m : *src)
+            {
+                if (std::find(peers.begin(), peers.end(), m.peer) == peers.end()) { peers.push_back(m.peer); }
+            }
+        }
+        auto append = [&](int peer, const Messages& srcMsgs, const Indices& srcIdx)
+        {
+            for (const auto& m : srcMsgs)
+            {
+                for (TreeNodeIndex k = m.offset; m.peer == peer && k < m.offset + m.count; ++k)
+                {
+                    addNode(msgs, idx, peer, srcIdx[k]);
+                }
+            }
+        };
+        for (int peer : peers)
+        {
+            append(peer, aMsgs, aIdx);
+            append(peer, bMsgs, bIdx);
+        }
+    };
+
+    SweepLists merged;
+    merged.send.resize(a.send.size());
+    merged.recv.resize(a.recv.size());
+    for (size_t l = 0; l < a.send.size(); ++l)
+    {
+        mergeLevel(a.send[l], a.sendIdx, b.send[l], b.sendIdx, merged.send[l], merged.sendIdx);
+        mergeLevel(a.recv[l], a.recvIdx, b.recv[l], b.recvIdx, merged.recv[l], merged.recvIdx);
+    }
+    return merged;
+}
+
 /*! @brief p2p upsweep + downsweep of the global tree
  *
  * @param[in]    gOctree          global octree, same on all ranks
- * @param[in]    up               up lists from computeSweepLists
- * @param[in]    upFlagged        extra up lists from computeFlagLists
- * @param[in]    downFlagged      down lists from computeFlagLists
+ * @param[in]    up               up lists merged with the upFlagged lists of computeFlagLists
+ * @param[in]    down             downFlagged lists from computeFlagLists
  * @param[inout] globQ            in: my global leaf quantities at their node positions
  *                                out: valid for the nodes I own and the children of my flagged nodes
  * @param[in]    comm             MPI communicator
  * @param[in]    upsweepFunction  upsweep of one level
  * @param[in]    upsweepArgs      extra upsweep arguments, e.g. expansion centers
  *
- * Pass 2. Upsweep per level, up and upFlagged lists to the parent owners, then I compute my parents.
- * Downsweep per level, downFlagged lists to the child owners, root first.
+ * Pass 2. Upsweep per level, up lists to the parent owners, then I compute my parents.
+ * Downsweep per level, down lists to the child owners, root first. 2L rounds.
  */
 template<class Q, class KeyType, class F, class... UArgs>
 void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
-                   const SweepLists&                 up,        // becomes member
-                   const SweepLists&                 upFlagged, // becomes member
-                   const SweepLists&                 downFlagged, // becomes member
+                   const SweepLists&                 up,   // becomes member
+                   const SweepLists&                 down, // becomes member
                    std::span<Q> globQ, MPI_Comm comm, F&& upsweepFunction, UArgs&&... upsweepArgs)
 {
     auto levelRange      = gOctree.levelRangeSpan();
@@ -324,7 +371,6 @@ void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
         exchangeLevel(up, l, upsweepTag + l, globQ, comm);
-        exchangeLevel(upFlagged, l, upsweepTag + l, globQ, comm);
         //! compute the parents Q values
         upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data(), upsweepArgs...);
     }
@@ -332,7 +378,7 @@ void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
     //! downsweep
     for (int l = 0; l < numParentLevels; ++l)
     {
-        exchangeLevel(downFlagged, l, downsweepTag + l, globQ, comm);
+        exchangeLevel(down, l, downsweepTag + l, globQ, comm);
     }
 }
 

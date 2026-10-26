@@ -95,10 +95,11 @@ int main(int argc, char** argv)
         auto upLists = computeSweepLists(gOctree, assignment, myRank);
         auto [upFlagged, downFlagged] =
             computeFlagLists(gOctree, assignment, upLists, std::span<const uint8_t>(flags), MPI_COMM_WORLD);
+        auto upMerged = mergeLists(upLists, upFlagged);
 
         //! compute global upsweep level by level
         double t2 = MPI_Wtime();
-        globalUpsweep(gOctree, upLists, upFlagged, downFlagged, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
+        globalUpsweep(gOctree, upMerged, downFlagged, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
         
         double t3 = MPI_Wtime();
         if (r == 0) { continue; }
