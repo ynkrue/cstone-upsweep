@@ -35,7 +35,6 @@ constexpr int downsweepTag = 6600; // parent owner to child owner
 template<class KeyType>
 int nodeOwner(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment, TreeNodeIndex i)
 { return assignment.findRank(decodePlaceholderBit(gOctree.prefixes[i])); }
-{ return assignment.findRank(decodePlaceholderBit(gOctree.prefixes[i])); }
 
 /*! @brief send/recv lists of one sweep (up or down) per parent level
  *
@@ -74,7 +73,6 @@ SweepLists computeSweepLists(OctreeView<const KeyType>     gOctree,
     auto levelRange = gOctree.levelRangeSpan();
     int  numLevels  = maxDepth(levelRange.data(), levelRange.size()); // L
     auto globDispl  = assignment.treeOffsetsConst();
-    auto globDispl  = assignment.treeOffsetsConst();
     auto parent     = [&](TreeNodeIndex i) { return gOctree.parents[(i - 1) / 8]; };
     auto owner      = [&](TreeNodeIndex i) { return nodeOwner(gOctree, assignment, i); };
 
@@ -91,11 +89,9 @@ SweepLists computeSweepLists(OctreeView<const KeyType>     gOctree,
     std::sort(boundaryParents.begin(), boundaryParents.end());
     boundaryParents.erase(std::unique(boundaryParents.begin(), boundaryParents.end()), boundaryParents.end());
 
-    SweepLists up, down;
+    SweepLists up;
     up.send.resize(numLevels);
     up.recv.resize(numLevels);
-    down.send.resize(numLevels);
-    down.recv.resize(numLevels);
 
     int l = 0; // level of parent i
     for (TreeNodeIndex i : boundaryParents)
@@ -110,20 +106,11 @@ SweepLists computeSweepLists(OctreeView<const KeyType>     gOctree,
         {
             int childOwner = owner(c);
             if (childOwner == parentOwner) { continue; }
-            bool firstOfOwner = owner(c - 1) != childOwner; // only the first child of each owner adds the down message
-            if (childOwner == myRank_)
-            {
-                addNode(up.send[l], up.sendIdx, parentOwner, c);
-                if (firstOfOwner) { addDown(down.recv[l], down.recvIdx, parentOwner, childOwner, i); }
-            }
-            if (parentOwner == myRank_)
-            {
-                addNode(up.recv[l], up.recvIdx, childOwner, c);
-                if (firstOfOwner) { addDown(down.send[l], down.sendIdx, childOwner, childOwner, i); }
-            }
+            if (childOwner == myRank_) { addNode(up.send[l], up.sendIdx, parentOwner, c); }
+            if (parentOwner == myRank_) { addNode(up.recv[l], up.recvIdx, childOwner, c); }
         }
     }
-    return {up, down};
+    return up;
 }
 
 //! @brief exchange the values of one level: send globQ[sendIdx], receive into globQ[recvIdx]
