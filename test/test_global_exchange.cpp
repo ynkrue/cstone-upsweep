@@ -1,7 +1,7 @@
 /*! @file
  * @brief test globalUpsweep against a single-rank upsweep of the global tree
  *
- * Usage: test_global_exchange [L=3] [n=32] [theta=0] [reps=50]
+ * Usage: test_global_exchange [L=3] [theta=1.1] [reps=50]
  */
 
 #include <algorithm>
@@ -33,15 +33,14 @@ int main(int argc, char** argv)
     MPI_Comm_rank(MPI_COMM_WORLD, &myRank);
     MPI_Comm_size(MPI_COMM_WORLD, &numRanks);
 
-    int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 3;  // L, 8^L global leaves
-    unsigned numPerCell = argc > 2 ? std::atoi(argv[2]) : 32; // particles per global leaf
-    double   theta      = argc > 3 ? std::atof(argv[3]) : 1.1;  // MAC opening angle, 0: overlap flags
-    int      numReps    = argc > 4 ? std::atoi(argv[4]) : 50; // timed calls after one warm-up call
+    int      numLevels  = argc > 1 ? std::atoi(argv[1]) : 3;    // L, 8^L global leaves
+    double   theta      = argc > 2 ? std::atof(argv[2]) : 1.1;  // MAC opening angle
+    int      numReps    = argc > 3 ? std::atoi(argv[3]) : 50;   // timed calls
 
     //! regular global tree with L levels
     std::vector<KeyType> gLeaves = cstone::makeNLevelGrid<KeyType>(numLevels);
     gLeaves.push_back(cstone::nodeRange<KeyType>(0));
-    std::vector<unsigned> gCounts(cstone::nNodes(gLeaves), numPerCell);
+    std::vector<unsigned> gCounts(cstone::nNodes(gLeaves), 32);
 
     //! global tree, distributed across ranks
     cstone::OctreeData<KeyType, cstone::execution::Cpu> globalTree;
@@ -65,55 +64,49 @@ int main(int argc, char** argv)
     cstone::scatter(gOctree.leafToInternalSpan(), gLeafQ.data(), globQRef.data());
     upsweep(gOctree.levelRangeSpan(), gOctree.childOffsets, globQRef.data());
 
+    //! populate quantities on global tree
     TreeNodeIndex             globNumNodes = globDispl[myRank + 1] - globDispl[myRank];
     std::span<const unsigned> gLeafQLoc(gLeafQ.data() + globDispl[myRank], globNumNodes);
     std::vector<unsigned>     globQ(gOctree.numNodes);
     cstone::scatter(gOctree.leafToInternalSpan().subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(),
                     globQ.data());
 
-    //! p2p per call: flags, lists, upsweep + downsweep; call 0 is the warm-up
-    auto                              parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
-    std::vector<uint8_t>              flags(gOctree.numNodes);
-    cstone::Box<double>               box(0, 1);
+    //! p2p global distributed upsweep
+    auto parent = [&](TreeNodeIndex c) { return gOctree.parents[(c - 1) / 8]; };
+    std::vector<uint8_t> flags(gOctree.numNodes);
+    cstone::Box<double> box(0, 1);
     std::vector<cstone::Vec4<double>> centers(gOctree.numNodes);
-    double                            times[4] = {0, 0, 0, 0}; // flags, lists, upsweep, allgather [s per call]
+    double times[4] = {0, 0, 0, 0}; // flags, lists, upsweep, allgather
     for (int r = 0; r <= numReps; ++r)
     {
-        //! flags: nodes that fail the minMAC against one of my leaves, theta 0: the ancestors of my leaves (overlap)
         MPI_Barrier(MPI_COMM_WORLD);
         double t0 = MPI_Wtime();
+        
+        //! flag nodes that fail the minMAC against one of my leaves
         std::fill(flags.begin(), flags.end(), 0);
-        if (theta > 0)
-        {
-            cstone::geoMacSpheres(std::span<const KeyType>(gOctree.prefixes, gOctree.numNodes), centers.data(),
-                                  cstone::invThetaMinMac(theta), box);
-            cstone::markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box,
-                             gLeaves.data() + globDispl[myRank], globNumNodes, false, flags.data());
-        }
-        else
-        {
-            for (TreeNodeIndex i = globDispl[myRank]; i < globDispl[myRank + 1]; ++i) // walk through my leaves
-            {
-                for (TreeNodeIndex n = gOctree.leafToInternalSpan()[i]; n != 0; n = parent(n)) // walk through ancestors
-                {
-                    flags[parent(n)] = 1;
-                }
-            }
-        }
-        MPI_Barrier(MPI_COMM_WORLD); // the stand-in flags are unbalanced, the sweep must not measure waiting for them
-        double t1      = MPI_Wtime();
-        auto   upLists = computeSweepLists(gOctree, assignment, myRank);
-        double t2      = MPI_Wtime();
-        globalUpsweep(gOctree, assignment, upLists, flags, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
-        double t3 = MPI_Wtime();
+        cstone::geoMacSpheres(std::span<const KeyType>(gOctree.prefixes, gOctree.numNodes), centers.data(),
+                                cstone::invThetaMinMac(theta), box);
+        cstone::markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box,
+                            gLeaves.data() + globDispl[myRank], globNumNodes, false, flags.data());
+        MPI_Barrier(MPI_COMM_WORLD); // wait for all ranks
+        
+        //! compute up lists
+        double t1 = MPI_Wtime();
+        auto upLists = computeSweepLists(gOctree, assignment, myRank);
 
+        //! compute global upsweep level by level
+        double t2 = MPI_Wtime();
+        globalUpsweep(gOctree, assignment, upLists, std::span<const uint8_t>(flags), std::span<unsigned>(globQ),
+                      MPI_COMM_WORLD, upsweep);
+        
+        double t3 = MPI_Wtime();
         if (r == 0) { continue; }
         times[0] += (t1 - t0) / numReps;
         times[1] += (t2 - t1) / numReps;
         times[2] += (t3 - t2) / numReps;
     }
 
-    //! reference: Allgatherv of the global leaves + upsweep of the whole tree, as in FocusedOctree::globalExchange
+    //! Allgatherv reference of the global leaves + upsweep (FocusedOctree::globalExchange)
     std::vector<int> globCounts(numRanks);
     for (int r = 0; r < numRanks; ++r)
     {

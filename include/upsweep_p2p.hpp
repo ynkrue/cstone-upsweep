@@ -23,11 +23,9 @@ namespace upsweep_p2p
 using namespace cstone;
 
 // MPI tags
-constexpr int upsweepTag   = 6500;
-constexpr int downsweepTag = 6600;
-constexpr int flagTag      = 6700;
-constexpr int requestTag   = 6800; // and 6801, alternating per call
-constexpr int replyTag     = 6900;
+constexpr int upsweepTag   = 6500; // child owner to parent owner
+constexpr int downsweepTag = 6600; // parent owner to child owner, NBX replies
+constexpr int requestTag   = 6700; // and 6701, NBX requests to owners
 
 /*! @brief owner rank of global node i: the rank holding the node's first leaf
  *
@@ -161,50 +159,68 @@ inline void addFlagged(const TreeNodeIndex* childOffsets, std::vector<SweepLists
     }
 }
 
-/*! @brief get the children of my held nodes from their owners
+//! @brief append the 8 children of each node in @p nodes for @p peer
+inline void addChildren(const TreeNodeIndex* childOffsets, std::vector<SweepLists::Message>& msgs,
+                        std::vector<TreeNodeIndex>& idx, int peer, std::span<const TreeNodeIndex> nodes)
+{
+    for (TreeNodeIndex n : nodes)
+    {
+        for (TreeNodeIndex c = childOffsets[n]; c < childOffsets[n] + 8; ++c)
+        {
+            addNode(msgs, idx, peer, c);
+        }
+    }
+}
+
+/*! @brief get the children of my held nodes from their owners with NBX (Hoefler et al. 2010)
  *
- * Every owner of a held node gets my held flags. Owners don't know who asks: requests go out with MPI_Issend, owners
- * receive them with MPI_Iprobe until the MPI_Ibarrier, entered once my requests are matched, completes (NBX).
+ * Owners don't know who asks. Every rank sends one request per owner with MPI_Issend and probes for requests from any
+ * rank. Once its own requests are matched it enters the MPI_Ibarrier and keeps probing, when the barrier completes
+ * every request has arrived. Then the owners send the children back, they have them after the upsweep.
  */
 template<class Q, class KeyType>
 void fetchFromOwners(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment,
                      std::span<const uint8_t> held, std::span<Q> globQ, MPI_Comm comm)
 {
+    // the tag alternates, ranks are at most one call apart and a probe must not match the next call
     static int call = 0;
-    int        tag  = requestTag + (call++ & 1); // a probe must not match a request of the next call
-    int        myRank;
-    MPI_Comm_rank(comm, &myRank);
-    auto owner   = [&](TreeNodeIndex n) { return nodeOwner(gOctree, assignment, n); };
-    auto ownedBy = [&](std::span<const uint8_t> f, int rank)
-    {
-        std::vector<uint8_t> o(f.size());
-        for (size_t n = 0; n < f.size(); ++n)
-        {
-            o[n] = f[n] && owner(n) == rank;
-        }
-        return o;
-    };
+    int        tag  = requestTag + (call++ & 1);
 
-    std::vector<int> owners;
+    //! my requests by owner, one message per owner
+    std::vector<std::pair<int, TreeNodeIndex>> byOwner;
     for (TreeNodeIndex n = 0; n < gOctree.numNodes; ++n)
     {
-        if (held[n]) { owners.push_back(owner(n)); }
+        if (held[n]) { byOwner.push_back({nodeOwner(gOctree, assignment, n), n}); }
     }
-    std::sort(owners.begin(), owners.end());
-    owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+    std::sort(byOwner.begin(), byOwner.end());
+    std::vector<int>                        owners;
+    std::vector<std::vector<TreeNodeIndex>> nodesPerOwner;
+    for (auto [owner, n] : byOwner)
+    {
+        if (owners.empty() || owners.back() != owner)
+        {
+            owners.push_back(owner);
+            nodesPerOwner.emplace_back();
+        }
+        nodesPerOwner.back().push_back(n);
+    }
 
-    SweepLists replies; // one level
+    // the owners send the children back
+    SweepLists replies;
     replies.send.resize(1);
     replies.recv.resize(1);
+
+    //! send my requests
     std::vector<MPI_Request> sends(owners.size());
     for (size_t i = 0; i < owners.size(); ++i)
     {
-        MPI_Issend(held.data(), gOctree.numNodes, MPI_UINT8_T, owners[i], tag, comm, &sends[i]);
-        addFlagged(gOctree.childOffsets, replies.recv[0], replies.recvIdx, owners[i], ownedBy(held, owners[i]));
+        MPI_Issend(nodesPerOwner[i].data(), int(nodesPerOwner[i].size()), MpiType<TreeNodeIndex>{}, owners[i], tag,
+                   comm, &sends[i]);
+        addChildren(gOctree.childOffsets, replies.recv[0], replies.recvIdx, owners[i], nodesPerOwner[i]);
     }
 
-    std::vector<uint8_t> request(gOctree.numNodes);
-    MPI_Request          barrier = MPI_REQUEST_NULL;
+    //! receive requests from any rank until the barrier completes, enter it once my requests are matched
+    MPI_Request barrier = MPI_REQUEST_NULL;
     for (int done = 0; !done;)
     {
         int        haveRequest;
@@ -212,9 +228,11 @@ void fetchFromOwners(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyT
         MPI_Iprobe(MPI_ANY_SOURCE, tag, comm, &haveRequest, &status);
         if (haveRequest)
         {
-            MPI_Recv(request.data(), gOctree.numNodes, MPI_UINT8_T, status.MPI_SOURCE, tag, comm, MPI_STATUS_IGNORE);
-            addFlagged(gOctree.childOffsets, replies.send[0], replies.sendIdx, status.MPI_SOURCE,
-                       ownedBy(request, myRank));
+            int count;
+            mpiGetCount<TreeNodeIndex>(&status, &count);
+            std::vector<TreeNodeIndex> nodes(count);
+            mpiRecvSync(nodes.data(), count, status.MPI_SOURCE, tag, MPI_STATUS_IGNORE, comm);
+            addChildren(gOctree.childOffsets, replies.send[0], replies.sendIdx, status.MPI_SOURCE, nodes);
         }
         if (barrier != MPI_REQUEST_NULL) { MPI_Test(&barrier, &done, MPI_STATUS_IGNORE); }
         else
@@ -224,12 +242,15 @@ void fetchFromOwners(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyT
             if (sent) { MPI_Ibarrier(comm, &barrier); }
         }
     }
-    exchangeLevel(replies, 0, replyTag, globQ, comm);
+
+    //! send the children of the requested nodes back
+    exchangeLevel(replies, 0, downsweepTag, globQ, comm);
 }
 
-/*! @brief p2p upsweep + downsweep of the global tree
+/*! @brief p2p upsweep + downsweep of the global tree, the requests travel with the upsweep
  *
  * @param[in]    gOctree          global octree, same on all ranks
+ * @param[in]    assignment       SFC key range per rank
  * @param[in]    up               up lists from computeSweepLists
  * @param[in]    flags            length numNodes, I need the children of every flagged node
  * @param[inout] globQ            in: my global leaf quantities at their node positions
@@ -238,10 +259,9 @@ void fetchFromOwners(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyT
  * @param[in]    upsweepFunction  upsweep of one level
  * @param[in]    upsweepArgs      extra upsweep arguments, e.g. expansion centers
  *
- * held: flagged internal nodes I don't own, of mine or of the ranks below me.
- * Upsweep: per level l the values and the held flags of levels <= l go to the parent owner, then I compute my parents.
- * What is still held after the upsweep comes from the owners. Downsweep: per level l the pairs reversed, the children
- * of the flags that went up in round l.
+ * Upsweep per level, values and requests to the parent owner, the parent owner answers what it owns in the downsweep.
+ * A request stops climbing at the level of its node, after the upsweep it goes to the owner with NBX.
+ * Downsweep per level, the children of the requests that went up, root first.
  */
 template<class Q, class KeyType, class F, class... UArgs>
 void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
@@ -254,57 +274,68 @@ void globalUpsweep(cstone::OctreeView<const KeyType> gOctree,
     MPI_Comm_rank(comm, &myRank);
     auto levelRange      = gOctree.levelRangeSpan();
     int  numParentLevels = int(up.send.size());
-    auto needed          = [&](TreeNodeIndex n)
-    { return gOctree.childOffsets[n] != 0 && nodeOwner(gOctree, assignment, n) != myRank; };
+    auto owner           = [&](TreeNodeIndex n) { return nodeOwner(gOctree, assignment, n); };
 
+    // extra nodes that go down during the downsweep
+    SweepLists downFlagged;
+    downFlagged.send.resize(numParentLevels);
+    downFlagged.recv.resize(numParentLevels);
+
+    //! requests on my rank, flagged nodes owned by another rank
     std::vector<uint8_t> held(gOctree.numNodes);
     for (TreeNodeIndex n = 0; n < gOctree.numNodes; ++n)
     {
-        held[n] = flags[n] && needed(n);
+        held[n] = flags[n] && gOctree.childOffsets[n] != 0 && owner(n) != myRank;
     }
-    SweepLists down;
-    down.send.resize(numParentLevels);
-    down.recv.resize(numParentLevels);
 
-    //! upsweep
+    //! upsweep, values and requests to the parent owner level by level
     for (int l = numParentLevels - 1; l >= 0; --l)
     {
-        //! held flags of levels <= l = the first levelRange[l + 1] nodes
-        TreeNodeIndex            prefix = levelRange[l + 1];
+        // requests up to level l go up, deeper ones stay here and come from their owner with NBX
+        TreeNodeIndex prefix = levelRange[l + 1];
+
+        // receive the requests of my child owners
         std::vector<uint8_t>     recvFlags(up.recv[l].size() * prefix);
-        std::vector<MPI_Request> flagRequests;
+        std::vector<MPI_Request> mpiRequests;
         for (size_t i = 0; i < up.recv[l].size(); ++i)
         {
-            mpiRecvAsync(recvFlags.data() + i * prefix, prefix, up.recv[l][i].peer, flagTag + l, flagRequests, comm);
+            mpiRecvAsync(recvFlags.data() + i * prefix, prefix, up.recv[l][i].peer, upsweepTag + l, mpiRequests, comm);
         }
+        // send my requests to my parent owner, it sends the children back in the downsweep
         for (const auto& m : up.send[l])
         {
-            mpiSendAsync(held.data(), prefix, m.peer, flagTag + l, flagRequests, comm);
-            addFlagged(gOctree.childOffsets, down.recv[l], down.recvIdx, m.peer, {held.data(), size_t(prefix)});
+            mpiSendAsync(held.data(), prefix, m.peer, upsweepTag + l, mpiRequests, comm);
+            addFlagged(gOctree.childOffsets, downFlagged.recv[l], downFlagged.recvIdx, m.peer,
+                       {held.data(), size_t(prefix)});
         }
+        // send the values of my children to my parent owner
         exchangeLevel(up, l, upsweepTag + l, globQ, comm);
-        MPI_Waitall(int(flagRequests.size()), flagRequests.data(), MPI_STATUSES_IGNORE);
+        MPI_Waitall(int(mpiRequests.size()), mpiRequests.data(), MPI_STATUSES_IGNORE);
 
-        if (!up.send[l].empty()) { std::fill(held.begin(), held.begin() + prefix, 0); } // they come back down
+        if (!up.send[l].empty()) { std::fill(held.begin(), held.begin() + prefix, 0); } // my parent owner has them now
+
+        // send the children back in the downsweep, keep requests for nodes I don't own
         for (size_t i = 0; i < up.recv[l].size(); ++i)
         {
-            std::span<const uint8_t> f(recvFlags.data() + i * prefix, prefix);
-            addFlagged(gOctree.childOffsets, down.send[l], down.sendIdx, up.recv[l][i].peer, f);
+            std::span<const uint8_t> peerFlags(recvFlags.data() + i * prefix, prefix);
+            addFlagged(gOctree.childOffsets, downFlagged.send[l], downFlagged.sendIdx, up.recv[l][i].peer, peerFlags);
             for (TreeNodeIndex n = 0; n < prefix; ++n)
             {
-                held[n] |= f[n] && needed(n);
+                held[n] |= peerFlags[n] && owner(n) != myRank;
             }
         }
+
         //! compute the parents Q values
         upsweepFunction(levelRange.subspan(l, 2), gOctree.childOffsets, globQ.data(), upsweepArgs...);
     }
 
+    //! the requests nobody on the way owns
     fetchFromOwners(gOctree, assignment, std::span<const uint8_t>(held), globQ, comm);
 
     //! downsweep
     for (int l = 0; l < numParentLevels; ++l)
     {
-        exchangeLevel(down, l, downsweepTag + l, globQ, comm);
+        exchangeLevel(downFlagged, l, downsweepTag + l, globQ, comm);
     }
 }
 
