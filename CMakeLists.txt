@@ -21,3 +21,9 @@ target_link_libraries(upsweep_p2p INTERFACE cstone MPI::MPI_CXX OpenMP::OpenMP_C
 add_executable(test_global_exchange test/test_global_exchange.cpp)
 target_link_libraries(test_global_exchange PRIVATE upsweep_p2p)
 target_compile_options(test_global_exchange PRIVATE -Wall -Wextra)
+
+# same test with a multipole of 98 doubles per node instead of a count
+add_executable(test_global_exchange_multipole test/test_global_exchange.cpp)
+target_compile_definitions(test_global_exchange_multipole PRIVATE MULTIPOLE)
+target_link_libraries(test_global_exchange_multipole PRIVATE upsweep_p2p)
+target_compile_options(test_global_exchange_multipole PRIVATE -Wall -Wextra)

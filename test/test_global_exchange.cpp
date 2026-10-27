@@ -5,10 +5,10 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <numeric>
 #include <vector>
 
 #include <mpi.h>
@@ -23,6 +23,32 @@
 #include "upsweep_p2p.hpp"
 
 using namespace upsweep_p2p;
+
+#ifdef MULTIPOLE
+using Q = std::array<double, 98>; // multipole per node, 98 doubles as in gromacs-fmm (order 5)
+#else
+using Q = unsigned; // particle count per node
+#endif
+
+//! leaf value i + 1, multipole component k i + 1 + k
+inline void setLeafValue(unsigned& q, size_t i) { q = i + 1; }
+inline void setLeafValue(std::array<double, 98>& q, size_t i)
+{
+    for (size_t k = 0; k < q.size(); ++k)
+    {
+        q[k] = i + 1 + k;
+    }
+}
+
+//! a += b, per component for multipoles
+inline void add(unsigned& a, unsigned b) { a += b; }
+inline void add(std::array<double, 98>& a, const std::array<double, 98>& b)
+{
+    for (size_t k = 0; k < a.size(); ++k)
+    {
+        a[k] += b[k];
+    }
+}
 
 int main(int argc, char** argv)
 {
@@ -53,21 +79,34 @@ int main(int argc, char** argv)
     std::span<const TreeNodeIndex> globDispl  = assignment.treeOffsetsConst();
 
     //! leaf quantity with distinct values
-    std::vector<unsigned> gLeafQ(cstone::nNodes(gLeaves));
-    std::iota(gLeafQ.begin(), gLeafQ.end(), 1u);
+    std::vector<Q> gLeafQ(cstone::nNodes(gLeaves));
+    for (size_t i = 0; i < gLeafQ.size(); ++i)
+    {
+        setLeafValue(gLeafQ[i], i);
+    }
 
-    auto upsweep = [](auto levelRange, auto childOffsets, auto Q)
-    { cstone::upsweep(levelRange, childOffsets, Q, cstone::NodeCount<unsigned>{}); };
+    //! parent = sum of its children, per component for multipoles
+    auto sumChildren = [](TreeNodeIndex, TreeNodeIndex c, const Q* q)
+    {
+        Q sum = q[c];
+        for (TreeNodeIndex octant = 1; octant < 8; ++octant)
+        {
+            add(sum, q[c + octant]);
+        }
+        return sum;
+    };
+    auto upsweep = [&](auto levelRange, auto childOffsets, Q* q)
+    { cstone::upsweep(levelRange, childOffsets, q, sumChildren); };
 
     //! reference upsweep of all global leaves
-    std::vector<unsigned> globQRef(gOctree.numNodes);
+    std::vector<Q> globQRef(gOctree.numNodes);
     cstone::scatter(gOctree.leafToInternalSpan(), gLeafQ.data(), globQRef.data());
     upsweep(gOctree.levelRangeSpan(), gOctree.childOffsets, globQRef.data());
 
     //! populate quantities on global tree
     TreeNodeIndex             globNumNodes = globDispl[myRank + 1] - globDispl[myRank];
-    std::span<const unsigned> gLeafQLoc(gLeafQ.data() + globDispl[myRank], globNumNodes);
-    std::vector<unsigned>     globQ(gOctree.numNodes);
+    std::span<const Q>        gLeafQLoc(gLeafQ.data() + globDispl[myRank], globNumNodes);
+    std::vector<Q>            globQ(gOctree.numNodes);
     cstone::scatter(gOctree.leafToInternalSpan().subspan(globDispl[myRank], gLeafQLoc.size()), gLeafQLoc.data(),
                     globQ.data());
 
@@ -99,7 +138,7 @@ int main(int argc, char** argv)
 
         //! compute global upsweep level by level
         double t2 = MPI_Wtime();
-        globalUpsweep(gOctree, upMerged, downFlagged, std::span<unsigned>(globQ), MPI_COMM_WORLD, upsweep);
+        globalUpsweep(gOctree, upMerged, downFlagged, std::span<Q>(globQ), MPI_COMM_WORLD, upsweep);
         
         double t3 = MPI_Wtime();
         if (r == 0) { continue; }
@@ -114,7 +153,7 @@ int main(int argc, char** argv)
     {
         globCounts[r] = globDispl[r + 1] - globDispl[r];
     }
-    std::vector<unsigned> gLeafQAll(gOctree.numLeafNodes), globQAll(gOctree.numNodes);
+    std::vector<Q> gLeafQAll(gOctree.numLeafNodes), globQAll(gOctree.numNodes);
     for (int r = 0; r <= numReps; ++r)
     {
         double t0 = MPI_Wtime();
@@ -139,8 +178,8 @@ int main(int argc, char** argv)
     if (myRank == 0)
     {
         std::printf("upsweep: %s (%d errors)\n", numErrors == 0 ? "PASS" : "FAIL", numErrors);
-        std::printf("time [ms] L %d P %d: flags %.3f | lists %.3f | upsweep %.3f || allgather %.3f\n", numLevels,
-                    numRanks, 1e3 * times[0], 1e3 * times[1], 1e3 * times[2], 1e3 * times[3]);
+        std::printf("time [ms] L %d P %d Q %zu B: flags %.3f | lists %.3f | upsweep %.3f || allgather %.3f\n",
+                    numLevels, numRanks, sizeof(Q), 1e3 * times[0], 1e3 * times[1], 1e3 * times[2], 1e3 * times[3]);
     }
 
     MPI_Finalize();
