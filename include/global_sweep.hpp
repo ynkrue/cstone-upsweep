@@ -86,7 +86,7 @@ using LevelPairs = std::vector<std::vector<PeerNodes>>;
 template<class KeyType>
 LevelPairs basePairs(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment, int myRank)
 {
-    GlobalExchangeRange functionRange("fmm:basePairs");
+    GlobalExchangeRange functionRange("cstone:basePairs");
     auto                levelRange = gOctree.levelRangeSpan();
     int                 depth      = maxDepth(levelRange.data(), levelRange.size());
 
@@ -113,73 +113,114 @@ LevelPairs basePairs(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyT
     return pairs;
 }
 
-//! @brief route requests for @p targets over the base pairs, append the mirrored value hops
-template<class KeyType>
-void routeRequests(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment,
-                   std::vector<TreeNodeIndex> targets, int myRank, MPI_Comm comm, LevelPairs& upPeers,
-                   LevelPairs& downPeers)
+//! @brief exchange graph with one node per combine or supplied value
+struct ExchangeGraph
 {
-    GlobalExchangeRange functionRange("fmm:routeRequests");
-    using NodeRequest = std::array<TreeNodeIndex, 2>; // {target, position at the receiver}
-    constexpr int tag = static_cast<int>(P2pTags::globalRequests);
+    std::vector<TreeNodeIndex> cellIds;       //!< global cell of each graph node
+    std::vector<int>           computeRanks;  //!< rank producing each node
+    std::vector<TreeNodeIndex> inputOffsets;
+    std::vector<TreeNodeIndex> inputIds;      //!< graph node IDs of the inputs
+    std::vector<TreeNodeIndex> targetOffsets;
+    std::vector<int>           targetRanks;   //!< ranks that need the complete value
 
-    int  depth    = int(upPeers.size());
-    auto owner    = [&](TreeNodeIndex i) { return nodeOwner(gOctree, assignment, i); };
-    auto parent   = [&](TreeNodeIndex i) { return gOctree.parents[(i - 1) / 8]; };
-    auto holdNode = [&](TreeNodeIndex i) { return owner(i) == myRank || (i != 0 && owner(parent(i)) == myRank); };
-    auto nextNode = [&](TreeNodeIndex target, TreeNodeIndex pos)
-    { return containsNode(gOctree, pos, target) ? childContaining(gOctree, pos, target) : parent(pos); };
+    TreeNodeIndex numNodes() const { return TreeNodeIndex(cellIds.size()); }
+};
 
-    // requests per edge level, waiting for their up or down round
-    std::vector<std::vector<NodeRequest>> upRequests(depth), downRequests(depth);
+/*! @brief base exchange graph with one node per global cell
+ */
+template<class KeyType>
+ExchangeGraph buildExchangeGraph(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment)
+{
+    GlobalExchangeRange functionRange("cstone:buildExchangeGraph");
+    ExchangeGraph       graph;
+    auto owner = [&](TreeNodeIndex i) { return nodeOwner(gOctree, assignment, i); };
 
-    //! walk locally while the path is mine, then queue for the round of the edge to the next owner
-    auto queueRequest = [&](TreeNodeIndex target, TreeNodeIndex pos)
+    graph.inputOffsets = {0};
+    graph.targetOffsets = {0};
+    for (TreeNodeIndex g = 0; g < gOctree.numNodes; ++g)
     {
-        // nothing to route if I own target or get it as a child of my own node in the upsweep
-        if (holdNode(target)) { return; }
-
-        while (owner(nextNode(target, pos)) == myRank)
+        graph.cellIds.push_back(g);
+        TreeNodeIndex firstChild = gOctree.childOffsets[g];
+        if (firstChild == 0)
         {
-            pos = nextNode(target, pos);
+            graph.computeRanks.push_back(owner(g));
         }
-        TreeNodeIndex next = nextNode(target, pos);
-
-        // the level of an edge is the level of its upper node
-        if (containsNode(gOctree, pos, target)) { downRequests[nodeLevel(gOctree, pos)].push_back({target, next}); }
         else
         {
-            upRequests[nodeLevel(gOctree, next)].push_back({target, next});
+            graph.computeRanks.push_back(-1);
+            for (int k = 0; k < 8; ++k)
+            {
+                 graph.inputIds.push_back(firstChild + k);
+            }
         }
+        graph.inputOffsets.push_back(graph.inputIds.size());
+        graph.targetRanks.push_back(owner(g));
+        graph.targetOffsets.push_back(graph.targetRanks.size());
+    }
+    return graph;
+}
+
+using TargetRequest = std::array<TreeNodeIndex, 3>; // {cell, position, requester}
+
+template<class KeyType>
+void addGraphTargets(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyType>& assignment, ExchangeGraph& graph, std::span<const TreeNodeIndex> localTargets, const LevelPairs& setupPairs, int myRank, MPI_Comm comm)
+{
+    GlobalExchangeRange functionRange("cstone:addGraphTargets");
+    constexpr int       tag = static_cast<int>(P2pTags::globalRequests);
+
+    auto owner  = [&](TreeNodeIndex i) { return nodeOwner(gOctree, assignment, i); };
+    auto parent = [&](TreeNodeIndex i) { return gOctree.parents[(i - 1) / 8]; };
+
+    //! next node on the tree path from pos to cell
+    auto nextNode = [&](TreeNodeIndex cell, TreeNodeIndex pos)
+    { return containsNode(gOctree, pos, cell) ? childContaining(gOctree, pos, cell) : parent(pos); };
+
+    std::vector<std::array<TreeNodeIndex, 2>> registered; // {cell, requester}
+
+    // requests per edge level, waiting for their up or down round
+    int                                     depth = int(setupPairs.size());
+    std::vector<std::vector<TargetRequest>> upRequests(depth), downRequests(depth);
+
+    //! register if I am the contact of cell, else walk while the path is mine and queue the next hop
+    auto queueRequest = [&](TreeNodeIndex cell, TreeNodeIndex pos, TreeNodeIndex requester)
+    {
+        if (owner(cell) == myRank)
+        {
+            registered.push_back({cell, requester});
+            return;
+        }
+
+        while (owner(nextNode(cell, pos)) == myRank)
+        {
+            pos = nextNode(cell, pos);
+        }
+        TreeNodeIndex next = nextNode(cell, pos);
+
+        // the level of an edge is the level of its upper node
+        if (containsNode(gOctree, pos, cell)) { downRequests[nodeLevel(gOctree, pos)].push_back({cell, next, requester}); }
+        else { upRequests[nodeLevel(gOctree, next)].push_back({cell, next, requester}); }
     };
 
-    /*! exchange the requests of edge level l with the base partners of that level
-     *
-     * Requests travel opposite to their values: an up request records a down value hop and vice versa.
-     * Every partner gets a message, also an empty one, so each rank knows how many messages it receives.
-     */
+    //! exchange the requests of edge level l with the base partners of that level, one message per partner
     auto exchangeRequests = [&](int l, bool up)
     {
-        std::vector<NodeRequest>& requests = up ? upRequests[l] : downRequests[l];
-        LevelPairs&               hops     = up ? downPeers : upPeers;
+        std::vector<TargetRequest>& requests = up ? upRequests[l] : downRequests[l];
 
         // up requests go child owner to parent owner, down requests the reverse
         std::vector<int> sendPeers, recvPeers;
-        for (const PeerNodes& e : upPeers[l])
+        for (const PeerNodes& e : setupPairs[l])
         {
             if (!(up ? e.send : e.recv).empty()) { sendPeers.push_back(e.peer); }
             if (!(up ? e.recv : e.send).empty()) { recvPeers.push_back(e.peer); }
         }
 
-        std::vector<std::vector<NodeRequest>> sendBuffers(sendPeers.size());
-        std::vector<MPI_Request>              mpiRequests;
+        std::vector<std::vector<TargetRequest>> sendBuffers(sendPeers.size());
+        std::vector<MPI_Request>                mpiRequests;
         for (std::size_t i = 0; i < sendPeers.size(); ++i)
         {
-            for (auto [target, next] : requests)
+            for (const TargetRequest& request : requests)
             {
-                if (owner(next) != sendPeers[i]) { continue; }
-                sendBuffers[i].push_back({target, next});
-                peerNodes(hops[l], sendPeers[i]).recv.push_back(target);
+                if (owner(request[1]) == sendPeers[i]) { sendBuffers[i].push_back(request); }
             }
             mpiSendAsync(sendBuffers[i].data(), sendBuffers[i].size(), sendPeers[i], tag, mpiRequests, comm);
         }
@@ -187,16 +228,15 @@ void routeRequests(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyTyp
         for (int peer : recvPeers)
         {
             MPI_Status status;
-            int        numInts;
+            int        numRequests;
             MPI_Probe(peer, tag, comm, &status);
-            MPI_Get_count(&status, MpiType<TreeNodeIndex>{}, &numInts);
+            mpiGetCount<TargetRequest>(&status, &numRequests);
 
-            std::vector<NodeRequest> received(numInts / 2);
-            mpiRecvSync(received.data(), int(received.size()), peer, tag, MPI_STATUS_IGNORE, comm);
-            for (auto [target, pos] : received)
+            std::vector<TargetRequest> received(numRequests);
+            mpiRecvSync(received.data(), numRequests, peer, tag, MPI_STATUS_IGNORE, comm);
+            for (auto [cell, pos, requester] : received)
             {
-                peerNodes(hops[l], peer).send.push_back(target);
-                queueRequest(target, pos);
+                queueRequest(cell, pos, requester);
             }
         }
 
@@ -204,18 +244,13 @@ void routeRequests(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyTyp
         requests.clear();
     };
 
-    // sorted and unique targets
-    std::sort(targets.begin(), targets.end());
-    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-
-    // start at the end of my range that faces the target
+    // start at the end of my range that faces the cell
     TreeNodeIndex firstLeaf = gOctree.leafToInternalSpan()[assignment.treeOffsetsConst()[myRank]];
     TreeNodeIndex lastLeaf  = gOctree.leafToInternalSpan()[assignment.treeOffsetsConst()[myRank + 1] - 1];
-    for (TreeNodeIndex target : targets)
+    for (TreeNodeIndex cell : localTargets)
     {
-        TreeNodeIndex start =
-            decodePlaceholderBit(gOctree.prefixes[target]) < assignment[myRank] ? firstLeaf : lastLeaf;
-        queueRequest(target, start);
+        TreeNodeIndex start = decodePlaceholderBit(gOctree.prefixes[cell]) < assignment[myRank] ? firstLeaf : lastLeaf;
+        queueRequest(cell, start, myRank);
     }
 
     // up rounds deepest edge level first, then down rounds top edge level first
@@ -227,6 +262,27 @@ void routeRequests(OctreeView<const KeyType> gOctree, const SfcAssignment<KeyTyp
     {
         exchangeRequests(l, false);
     }
+
+    // merge the graph node on the old targets plus the registered requesters of its cell
+    std::sort(registered.begin(), registered.end());
+    std::vector<TreeNodeIndex> targetOffsets{0};
+    std::vector<int>           targetRanks;
+    auto                       reg = registered.begin();
+    for (TreeNodeIndex g = 0; g < graph.numNodes(); ++g)
+    {
+        auto first = targetRanks.size();
+        targetRanks.insert(targetRanks.end(), graph.targetRanks.begin() + graph.targetOffsets[g],
+                           graph.targetRanks.begin() + graph.targetOffsets[g + 1]);
+        for (; reg != registered.end() && (*reg)[0] == graph.cellIds[g]; ++reg)
+        {
+            targetRanks.push_back((*reg)[1]);
+        }
+        std::sort(targetRanks.begin() + first, targetRanks.end());
+        targetRanks.erase(std::unique(targetRanks.begin() + first, targetRanks.end()), targetRanks.end());
+        targetOffsets.push_back(TreeNodeIndex(targetRanks.size()));
+    }
+    graph.targetOffsets = std::move(targetOffsets);
+    graph.targetRanks   = std::move(targetRanks);
 }
 
 /*! @brief send/recv lists of one sweep (up or down) per parent level
@@ -253,7 +309,7 @@ struct SweepLists
  */
 inline SweepLists<> toSweepLists(LevelPairs& pairs)
 {
-    GlobalExchangeRange functionRange("fmm:toSweepLists");
+    GlobalExchangeRange functionRange("cstone:toSweepLists");
     SweepLists<>        lists;
     lists.send.resize(pairs.size());
     lists.recv.resize(pairs.size());
@@ -321,7 +377,7 @@ void exchangeLevel(Exec exec, const SweepLists<IdxVec>& lists, int l, int tag, s
     //! Gather on the active execution space and send directly from the resulting buffer.
     if (!send.empty())
     {
-        GlobalExchangeRange packRange("fmm:global-exchange/p2p/send");
+        GlobalExchangeRange packRange("cstone:global-exchange/p2p/send");
         gather(exec, sendNodes, globQ.data(), sendBuf.data() + sFirst);
         if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
         for (const auto& m : send)
@@ -332,9 +388,9 @@ void exchangeLevel(Exec exec, const SweepLists<IdxVec>& lists, int l, int tag, s
     // wait for needed nodes
     if (!recv.empty())
     {
-        GlobalExchangeRange waitRange("fmm:global-exchange/p2p/wait");
+        GlobalExchangeRange waitRange("cstone:global-exchange/p2p/wait");
         MPI_Waitall(int(recvRequests.size()), recvRequests.data(), MPI_STATUSES_IGNORE);
-        GlobalExchangeRange scatterRange("fmm:global-exchange/p2p/scatter");
+        GlobalExchangeRange scatterRange("cstone:global-exchange/p2p/scatter");
         scatter(exec, recvNodes, recvBuf.data() + rFirst, globQ.data());
     }
 }
@@ -368,124 +424,5 @@ struct GlobalExchangeLists
     SweepLists<IdxVec>                        up, down;
     std::vector<std::array<TreeNodeIndex, 2>> ownedParents;
 };
-
-/*! @brief FocusedOctree::createGlobalExchangeLists with the wanted global nodes passed in
- *
- * @param[in] exec        execution policy
- * @param[in] gOctree     global octree
- * @param[in] assignment  global SFC assignment
- * @param[in] targets     global nodes this rank wants
- * @param[in] myRank      executing rank
- * @param[in] comm        communicator
- */
-template<class IdxVec, class Exec, class KeyType>
-GlobalExchangeLists<IdxVec> createGlobalExchangeLists(Exec exec, OctreeView<const KeyType> gOctree,
-                                                      const SfcAssignment<KeyType>& assignment,
-                                                      std::vector<TreeNodeIndex> targets, int myRank, MPI_Comm comm)
-{
-    GlobalExchangeRange                 setupRange("fmm:global-exchange/setup");
-    OctreeData<KeyType, execution::Cpu> globalTreeHost;
-    OctreeView<const KeyType>           globalTreeView = gOctree;
-    if constexpr (execution::HaveGpu<Exec>{})
-    {
-        //! List construction and request routing on CPU
-        downloadOctreeFromGpu(exec, globalTreeHost, gOctree);
-        syncGpu(exec);
-        globalTreeView = globalTreeHost.cdata();
-    }
-
-    //! get the basic upsweep communication pairs
-    auto       upPeers = basePairs(globalTreeView, assignment, myRank);
-    LevelPairs downPeers(upPeers.size());
-
-    //! append the wanted nodes, routed over upsweep pairs
-    routeRequests(globalTreeView, assignment, std::move(targets), myRank, comm, upPeers, downPeers);
-
-    //! flatten into per-level send/recv lists, indices into the execution space
-    auto toAcc = [](SweepLists<> host)
-    {
-        SweepLists<IdxVec> acc;
-        acc.send    = std::move(host.send);
-        acc.recv    = std::move(host.recv);
-        acc.sendIdx = host.sendIdx;
-        acc.recvIdx = host.recvIdx;
-        return acc;
-    };
-
-    GlobalExchangeLists<IdxVec> lists;
-    lists.up           = toAcc(toSweepLists(upPeers));
-    lists.down         = toAcc(toSweepLists(downPeers));
-    lists.ownedParents = computeOwnedParentRanges(globalTreeView, assignment, myRank);
-    return lists;
-}
-
-//! FocusedOctree::globalSweep extracted without changing the execution order or synchronization.
-template<class Exec, class KeyType, class Q, class IdxVec, class F, class... UArgs>
-void globalSweep(Exec exec, OctreeView<const KeyType> gOctree, const GlobalExchangeLists<IdxVec>& lists,
-                 std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf, MPI_Comm comm, F&& upsweepFunction,
-                 UArgs&&... upsweepArgs)
-{
-    GlobalExchangeRange functionRange("fmm:globalSweep");
-    const auto&         up              = lists.up;
-    const auto&         down            = lists.down;
-    const auto&         ownedParents    = lists.ownedParents;
-    int                 numParentLevels = int(up.send.size());
-
-    // Keep all messages in separate slices so later receives and earlier sends can remain active.
-    auto upSend       = sendBuf.first(up.sendIdx.size());
-    auto downSend     = sendBuf.subspan(up.sendIdx.size());
-    auto upRecv       = recvBuf.first(up.recvIdx.size());
-    auto downRecv     = recvBuf.subspan(up.recvIdx.size());
-    auto upRequests   = postSweepReceives(up, static_cast<int>(P2pTags::globalUp), upRecv, comm);
-    auto downRequests = postSweepReceives(down, static_cast<int>(P2pTags::globalDown), downRecv, comm);
-
-    //! send requests don't need to finsh by level (only at the end)
-    std::vector<MPI_Request> sendRequests;
-    std::size_t              numSends = 0;
-    for (const auto& msgs : up.send)
-    {
-        numSends += msgs.size();
-    }
-    for (const auto& msgs : down.send)
-    {
-        numSends += msgs.size();
-    }
-    sendRequests.reserve(numSends);
-
-    //! upsweep
-    for (int l = numParentLevels - 1; l >= 0; --l)
-    {
-        char upRangeName[64];
-        std::snprintf(upRangeName, sizeof(upRangeName), "fmm:global-exchange/p2p/up-level-%d", l);
-        GlobalExchangeRange upRange(upRangeName);
-
-        exchangeLevel(exec, up, l, static_cast<int>(P2pTags::globalUp) + l, globQ, upSend, upRecv, upRequests[l],
-                      sendRequests, comm);
-
-        //! compute the parents Q values, only for parents this rank owns
-        auto owned = ownedParents[l];
-        if (owned[0] < owned[1])
-        {
-            GlobalExchangeRange          parentRange("fmm:global-exchange/p2p/sweep");
-            std::array<TreeNodeIndex, 2> ownedLevelRange{owned[0], owned[1]};
-            upsweepFunction(std::span<const TreeNodeIndex>(ownedLevelRange), gOctree.childOffsets, globQ.data(),
-                            upsweepArgs...);
-        }
-    }
-
-    //! downsweep
-    for (int l = 0; l < numParentLevels; ++l)
-    {
-        char downRangeName[64];
-        std::snprintf(downRangeName, sizeof(downRangeName), "fmm:global-exchange/p2p/down-level-%d", l);
-        GlobalExchangeRange upRange(downRangeName);
-        exchangeLevel(exec, down, l, static_cast<int>(P2pTags::globalDown) + l, globQ, downSend, downRecv,
-                      downRequests[l], sendRequests, comm);
-    }
-
-    // wait for all sends to complete
-    GlobalExchangeRange sendWaitRange("fmm:global-exchange/p2p/send-wait");
-    MPI_Waitall(int(sendRequests.size()), sendRequests.data(), MPI_STATUSES_IGNORE);
-}
 
 } // namespace global_sweep
