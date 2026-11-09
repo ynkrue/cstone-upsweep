@@ -1,12 +1,12 @@
 #pragma once
 
 /*! @file
- * @brief Isolated GROMACS global exchange, compared with Allgather + full upsweep.
+ * @brief FocusedOctree::globalExchange without the LET: artificial wanted nodes, compared with Allgather + full upsweep
  */
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 #include <vector>
 #include <mpi.h>
 
@@ -20,14 +20,79 @@
 using namespace global_sweep;
 using Q = unsigned;
 
+//! @brief copy the host tree into the execution space, stands in for buildOctreeGpu in GROMACS DomainFixed
+template<class Exec, class KeyType>
+OctreeData<KeyType, Exec> uploadOctree(const OctreeData<KeyType, execution::Cpu>& host)
+{
+    OctreeData<KeyType, Exec> acc;
+    acc.resize(host.numLeafNodes);
+    acc.prefixes       = host.prefixes;
+    acc.childOffsets   = host.childOffsets;
+    acc.parents        = host.parents;
+    acc.levelRange     = host.levelRange;
+    acc.d_levelRange   = host.d_levelRange;
+    acc.internalToLeaf = host.internalToLeaf;
+    acc.leafToInternal = host.leafToInternal;
+    return acc;
+}
+
+/*! @brief artificial demand, replaces the LET to global mapping: the global nodes that fail the MAC
+ *
+ * @param[in] gOctree    global octree on the host
+ * @param[in] myLeaves   SFC keys of my leaves, length numLeaves + 1
+ * @param[in] numLeaves  number of leaves of this rank
+ * @param[in] theta      opening angle
+ * @return               flag per global node, 1 = wanted
+ */
+template<class KeyType>
+std::vector<uint8_t> flagNodes(OctreeView<const KeyType> gOctree, const KeyType* myLeaves, TreeNodeIndex numLeaves,
+                               double theta)
+{
+    std::vector<uint8_t>      flags(gOctree.numNodes);
+    std::vector<Vec4<double>> centers(gOctree.numNodes);
+    Box<double>               box(0, 1);
+    geoMacSpheres(std::span<const KeyType>(gOctree.prefixes, gOctree.numNodes), centers.data(), invThetaMinMac(theta),
+                  box);
+    markMacs(gOctree.prefixes, gOctree.childOffsets, gOctree.parents, centers.data(), box, myLeaves, numLeaves, false,
+             flags.data());
+    return flags;
+}
+
+//! @brief leaf values of repetition @p rep, different in every repetition so stale values fail the check
+inline void populate(int rep, std::span<Q> leafQ)
+{
+    for (std::size_t i = 0; i < leafQ.size(); ++i)
+    {
+        leafQ[i] = Q(i) + Q(rep) + 1;
+    }
+}
+
+/*! @brief FocusedOctree::globalExchange without populateGlobal / extractGlobal
+ *
+ * @param[in]  gOctree    global octree in the execution space
+ * @param[in]  lists      from createGlobalExchangeLists
+ * @param[in]  firstLeaf  index of my first global leaf
+ * @param[in]  localQ     values of my leaves
+ * @param[out] globQ      global node values: owned + wanted nodes are valid afterwards
+ */
+template<class Exec, class KeyType, class IdxVec, class F>
+void globalExchange(Exec exec, OctreeView<const KeyType> gOctree, const GlobalExchangeLists<IdxVec>& lists,
+                    TreeNodeIndex firstLeaf, std::span<const Q> localQ, std::span<Q> globQ, std::span<Q> sendBuf,
+                    std::span<Q> recvBuf, MPI_Comm comm, F&& upsweep)
+{
+    fill(exec, globQ.data(), globQ.data() + globQ.size(), Q{});
+    scatter(exec, gOctree.leafToInternalSpan().subspan(firstLeaf, localQ.size()), localQ.data(), globQ.data());
+    globalSweep(exec, gOctree, lists, globQ, sendBuf, recvBuf, comm, upsweep);
+}
+
 template<template<class...> class Vector, class Exec, class Upsweep>
 int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
 {
     using KeyType          = unsigned;
     constexpr double theta = 1.1;
-    constexpr int    reps  = 50;
+    constexpr int    reps  = 10;
 
-    // Global tree: same equal SFC boundaries as GROMACS.
+    // global tree
     std::vector<KeyType> boundaries(numRanks + 1);
     KeyType              stride = nodeRange<KeyType>(0) / numRanks;
     for (int r = 0; r < numRanks; ++r)
@@ -40,132 +105,108 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
     OctreeData<KeyType, execution::Cpu> tree;
     tree.resize(nNodes(leaves));
     updateInternalTree<KeyType>(leaves, tree.data());
-    auto hostTree   = tree.cdata();
-    hostTree.leaves = leaves.data();
-    auto assignment = makeSfcAssignment(numRanks, counts, leaves.data());
-    auto displ      = assignment.treeOffsetsConst();
-    int  localCount = displ[rank + 1] - displ[rank];
+    auto hostTree = tree.cdata();
 
-    // Rank-local demand: children of MAC-flagged cells.
-    MPI_Barrier(MPI_COMM_WORLD);
-    double                    start = MPI_Wtime();
-    std::vector<uint8_t>      flags(hostTree.numNodes);
-    std::vector<Vec4<double>> centers(hostTree.numNodes);
-    Box<double>               box(0, 1);
-    geoMacSpheres(std::span<const KeyType>(hostTree.prefixes, hostTree.numNodes), centers.data(), invThetaMinMac(theta),
-                  box);
-    markMacs(hostTree.prefixes, hostTree.childOffsets, hostTree.parents, centers.data(), box,
-             leaves.data() + displ[rank], localCount, false, flags.data());
+    // global tree in the execution space, as globalOctreeAcc_ in GROMACS DomainFixed
+    auto gOctreeAcc = uploadOctree<Exec>(tree);
+    auto gOctree    = gOctreeAcc.cdata();
+
+    auto          assignment = makeSfcAssignment(numRanks, counts, leaves.data());
+    auto          displ      = assignment.treeOffsetsConst();
+    TreeNodeIndex firstLeaf  = displ[rank];
+    TreeNodeIndex numLeaves  = displ[rank + 1] - displ[rank];
+
+    // the Allgather baseline needs the same number of leaves on every rank
+    for (int r = 0; r < numRanks; ++r)
+    {
+        if (displ[r + 1] - displ[r] == numLeaves) { continue; }
+        if (rank == 0) { std::printf("unequal leaves per rank at P %d, Allgather not possible\n", numRanks); }
+        return 1;
+    }
+
+    // wanted nodes
+    auto                       flags = flagNodes(hostTree, leaves.data() + firstLeaf, numLeaves, theta);
     std::vector<TreeNodeIndex> targets;
     for (TreeNodeIndex n = 0; n < hostTree.numNodes; ++n)
     {
-        if (!flags[n] || !hostTree.childOffsets[n]) { continue; }
-        for (TreeNodeIndex c = hostTree.childOffsets[n]; c < hostTree.childOffsets[n] + 8; ++c)
-        {
-            targets.push_back(c);
-        }
+        if (flags[n]) { targets.push_back(n); }
     }
-    double times[4] = {MPI_Wtime() - start, 0, 0, 0};
-    // Build the communication lists once.
+
+    // setup: lists once, includes the tree download as in GROMACS
     MPI_Barrier(MPI_COMM_WORLD);
-    start              = MPI_Wtime();
-    auto       upPeers = basePairs(hostTree, assignment, rank);
-    LevelPairs downPeers(upPeers.size());
-    routeRequests(hostTree, assignment, std::move(targets), rank, MPI_COMM_WORLD, upPeers, downPeers);
-    auto upHost = toSweepLists(upPeers), downHost = toSweepLists(downPeers);
-    auto owned = computeOwnedParentRanges(hostTree, assignment, rank);
+    double start = MPI_Wtime();
+    auto   lists = createGlobalExchangeLists<Vector<TreeNodeIndex>>(exec, gOctree, assignment, std::move(targets), rank,
+                                                                    MPI_COMM_WORLD);
+    double setupTime = MPI_Wtime() - start;
 
-    // Put indices and values in the execution space.
-    auto                              activeTree = hostTree;
-    SweepLists<Vector<TreeNodeIndex>> up, down;
-    up.send      = std::move(upHost.send);
-    up.recv      = std::move(upHost.recv);
-    up.sendIdx   = upHost.sendIdx;
-    up.recvIdx   = upHost.recvIdx;
-    down.send    = std::move(downHost.send);
-    down.recv    = std::move(downHost.recv);
-    down.sendIdx = downHost.sendIdx;
-    down.recvIdx = downHost.recvIdx;
-    Vector<TreeNodeIndex> children(hostTree.childOffsets, hostTree.childOffsets + hostTree.numNodes);
-    Vector<TreeNodeIndex> leafMap(hostTree.leafToInternalSpan().data(),
-                                  hostTree.leafToInternalSpan().data() + hostTree.numLeafNodes);
-    activeTree.childOffsets = children.data();
-    Vector<Q> localQ(localCount), globQ(hostTree.numNodes), allLeaves(hostTree.numLeafNodes), allQ(hostTree.numNodes);
-    Vector<Q> sendBuf(up.sendIdx.size() + down.sendIdx.size()), recvBuf(up.recvIdx.size() + down.recvIdx.size());
-    if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-    times[1] = MPI_Wtime() - start;
-    std::span<const TreeNodeIndex> leafIndices(leafMap.data(), hostTree.numLeafNodes);
-    std::vector<int>               rankCounts(numRanks);
-    for (int r = 0; r < numRanks; ++r)
+    Vector<Q> globQ(hostTree.numNodes), allLeaves(hostTree.numLeafNodes), allQ(hostTree.numNodes);
+    Vector<Q> sendBuf(lists.up.sendIdx.size() + lists.down.sendIdx.size());
+    Vector<Q> recvBuf(lists.up.recvIdx.size() + lists.down.recvIdx.size());
+
+    auto download = [](const Vector<Q>& v)
     {
-        rankCounts[r] = displ[r + 1] - displ[r];
-    }
-    bool equalCounts = std::all_of(rankCounts.begin(), rankCounts.end(), [&](int n) { return n == localCount; });
-    std::vector<Q> leafValues(hostTree.numLeafNodes), reference(hostTree.numNodes), result(hostTree.numNodes);
-    int            errors = 0;
-
-    // One warm-up, then repeated exchanges with fresh values.
-    for (int rep = 0; rep <= reps; ++rep)
-    {
-        for (size_t i = 0; i < leafValues.size(); ++i)
-        {
-            leafValues[i] = unsigned(i) + unsigned(rep) + 1;
-        }
-        cstone::scatter(hostTree.leafToInternalSpan(), leafValues.data(), reference.data());
-        cstone::upsweep(hostTree.levelRangeSpan(), hostTree.childOffsets, reference.data(), NodeCount<unsigned>{});
-        localQ = std::vector<Q>(leafValues.begin() + displ[rank], leafValues.begin() + displ[rank + 1]);
-        // Clear remote values before each exchange.
-        fill(exec, globQ.data(), globQ.data() + globQ.size(), Q{});
-        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-        MPI_Barrier(MPI_COMM_WORLD);
-        start = MPI_Wtime();
-        // Point-to-point sweep.
-        scatter(exec, leafIndices.subspan(displ[rank], localCount), localQ.data(), globQ.data());
-        globalUpsweep(exec, activeTree, up, down, owned, std::span<Q>(globQ.data(), globQ.size()),
-                      std::span<Q>(sendBuf.data(), sendBuf.size()), std::span<Q>(recvBuf.data(), recvBuf.size()),
-                      MPI_COMM_WORLD, upsweep);
-        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-        if (rep > 0) { times[2] += (MPI_Wtime() - start) / reps; }
-
-        MPI_Barrier(MPI_COMM_WORLD);
-        start = MPI_Wtime();
-        // Collective baseline.
-        if (equalCounts) { mpiAllgatherGpuDirect(exec, localQ.data(), allLeaves.data(), localCount, MPI_COMM_WORLD); }
+        if constexpr (execution::HaveGpu<Exec>{}) { return toHost(v); }
         else
         {
-            mpiAllgathervGpuDirect(exec, localQ.data(), localCount, allLeaves.data(), rankCounts.data(), displ.data(),
-                                   MPI_COMM_WORLD);
+            return v;
         }
-        scatter(exec, leafIndices, allLeaves.data(), allQ.data());
-        upsweep(hostTree.levelRangeSpan(), activeTree.childOffsets, allQ.data());
+    };
+
+    std::vector<Q>      leafQ(hostTree.numLeafNodes), reference(hostTree.numNodes);
+    std::vector<double> sweepTime(reps), allgatherTime(reps);
+    int                 errors = 0;
+    for (int rep = 0; rep < reps; ++rep)
+    {
+        populate(rep, leafQ);
+        cstone::scatter(hostTree.leafToInternalSpan(), leafQ.data(), reference.data());
+        cstone::upsweep(hostTree.levelRangeSpan(), hostTree.childOffsets, reference.data(), NodeCount<Q>{});
+        Vector<Q> localQ(leafQ.data() + firstLeaf, leafQ.data() + firstLeaf + numLeaves);
         if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
-        if (rep > 0) { times[3] += (MPI_Wtime() - start) / reps; }
-        // Check both paths against the CPU reference.
-        result = toHost(globQ);
+
+        // point-to-point
+        MPI_Barrier(MPI_COMM_WORLD);
+        start = MPI_Wtime();
+        globalExchange(exec, gOctree, lists, firstLeaf, std::span<const Q>(localQ.data(), localQ.size()),
+                       std::span<Q>(globQ.data(), globQ.size()), std::span<Q>(sendBuf.data(), sendBuf.size()),
+                       std::span<Q>(recvBuf.data(), recvBuf.size()), MPI_COMM_WORLD, upsweep);
+        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
+        sweepTime[rep] = MPI_Wtime() - start;
+
+        // Allgather + full upsweep
+        MPI_Barrier(MPI_COMM_WORLD);
+        start = MPI_Wtime();
+        mpiAllgatherGpuDirect(exec, localQ.data(), allLeaves.data(), numLeaves, MPI_COMM_WORLD);
+        scatter(exec, gOctree.leafToInternalSpan(), allLeaves.data(), allQ.data());
+        upsweep(gOctree.levelRangeSpan(), gOctree.childOffsets, allQ.data());
+        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
+        allgatherTime[rep] = MPI_Wtime() - start;
+
+        // check: owned + wanted nodes from p2p, all nodes from Allgather
+        auto p2pQ = download(globQ), fullQ = download(allQ);
         for (TreeNodeIndex i = 0; i < hostTree.numNodes; ++i)
         {
-            bool required =
-                nodeOwner(hostTree, assignment, i) == rank || (i > 0 && flags[hostTree.parents[(i - 1) / 8]]);
-            if (required && result[i] != reference[i]) { ++errors; }
-        }
-        result = toHost(allQ);
-        for (TreeNodeIndex i = 0; i < hostTree.numNodes; ++i)
-        {
-            if (result[i] != reference[i]) { ++errors; }
+            bool required = nodeOwner(hostTree, assignment, i) == rank || flags[i];
+            if (required && p2pQ[i] != reference[i]) { ++errors; }
+            if (fullQ[i] != reference[i]) { ++errors; }
         }
     }
-    // Report correctness and maximum-rank timings.
+
+    // maximum over ranks
     MPI_Allreduce(MPI_IN_PLACE, &errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(MPI_IN_PLACE, times, 4, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &setupTime, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, sweepTime.data(), reps, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, allgatherTime.data(), reps, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     if (rank == 0)
     {
-        auto [minLeaves, maxLeaves] = std::minmax_element(rankCounts.begin(), rankCounts.end());
-        std::printf("tree: %d ranks, %d leaves, %d-%d leaves/rank\n", numRanks, hostTree.numLeafNodes, *minLeaves,
-                    *maxLeaves);
+        std::printf("tree: P %d, %d leaves, %d leaves/rank, Q %zu B\n", numRanks, hostTree.numLeafNodes, numLeaves,
+                    sizeof(Q));
+        std::printf("setup [ms]: %.3f\n", setupTime * 1e3);
+        for (int rep = 0; rep < reps; ++rep)
+        {
+            std::printf("rep %d [ms]: p2p %.3f | allgather %.3f\n", rep+1, sweepTime[rep] * 1e3,
+                        allgatherTime[rep] * 1e3);
+        }
         std::printf("upsweep: %s (%d errors)\n", errors ? "FAIL" : "PASS", errors);
-        std::printf("time [ms] P %d Q %zu B: flags-once %.3f | lists/buffers-once %.3f | upsweep %.3f || %s %.3f\n",
-                    numRanks, sizeof(Q), times[0] * 1e3, times[1] * 1e3, times[2] * 1e3,
-                    equalCounts ? "allgather" : "allgatherv", times[3] * 1e3);
     }
     return errors != 0;
 }

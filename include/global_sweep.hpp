@@ -357,14 +357,78 @@ auto computeOwnedParentRanges(OctreeView<const KeyType> tree, const SfcAssignmen
     return owned;
 }
 
+/*! @brief lists of both sweeps and the owned parent ranges, built once in setup
+ *
+ * Message metadata (peer, offset, count) and owned ranges stay on the host, the node indices
+ * sendIdx/recvIdx live in IdxVec (device for GPU), as the globUpLists_/globDownLists_ members in GROMACS.
+ */
+template<class IdxVec>
+struct GlobalExchangeLists
+{
+    SweepLists<IdxVec>                        up, down;
+    std::vector<std::array<TreeNodeIndex, 2>> ownedParents;
+};
+
+/*! @brief FocusedOctree::createGlobalExchangeLists with the wanted global nodes passed in
+ *
+ * @param[in] exec        execution policy
+ * @param[in] gOctree     global octree
+ * @param[in] assignment  global SFC assignment
+ * @param[in] targets     global nodes this rank wants
+ * @param[in] myRank      executing rank
+ * @param[in] comm        communicator
+ */
+template<class IdxVec, class Exec, class KeyType>
+GlobalExchangeLists<IdxVec> createGlobalExchangeLists(Exec exec, OctreeView<const KeyType> gOctree,
+                                                      const SfcAssignment<KeyType>& assignment,
+                                                      std::vector<TreeNodeIndex> targets, int myRank, MPI_Comm comm)
+{
+    GlobalExchangeRange                 setupRange("fmm:global-exchange/setup");
+    OctreeData<KeyType, execution::Cpu> globalTreeHost;
+    OctreeView<const KeyType>           globalTreeView = gOctree;
+    if constexpr (execution::HaveGpu<Exec>{})
+    {
+        //! List construction and request routing on CPU
+        downloadOctreeFromGpu(exec, globalTreeHost, gOctree);
+        syncGpu(exec);
+        globalTreeView = globalTreeHost.cdata();
+    }
+
+    //! get the basic upsweep communication pairs
+    auto       upPeers = basePairs(globalTreeView, assignment, myRank);
+    LevelPairs downPeers(upPeers.size());
+
+    //! append the wanted nodes, routed over upsweep pairs
+    routeRequests(globalTreeView, assignment, std::move(targets), myRank, comm, upPeers, downPeers);
+
+    //! flatten into per-level send/recv lists, indices into the execution space
+    auto toAcc = [](SweepLists<> host)
+    {
+        SweepLists<IdxVec> acc;
+        acc.send    = std::move(host.send);
+        acc.recv    = std::move(host.recv);
+        acc.sendIdx = host.sendIdx;
+        acc.recvIdx = host.recvIdx;
+        return acc;
+    };
+
+    GlobalExchangeLists<IdxVec> lists;
+    lists.up           = toAcc(toSweepLists(upPeers));
+    lists.down         = toAcc(toSweepLists(downPeers));
+    lists.ownedParents = computeOwnedParentRanges(globalTreeView, assignment, myRank);
+    return lists;
+}
+
 //! FocusedOctree::globalSweep extracted without changing the execution order or synchronization.
 template<class Exec, class KeyType, class Q, class IdxVec, class F, class... UArgs>
-void globalUpsweep(Exec exec, OctreeView<const KeyType> gOctree, const SweepLists<IdxVec>& up,
-                   const SweepLists<IdxVec>& down, std::span<const std::array<TreeNodeIndex, 2>> ownedParents,
-                   std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf, MPI_Comm comm, F&& upsweepFunction,
-                   UArgs&&... upsweepArgs)
+void globalSweep(Exec exec, OctreeView<const KeyType> gOctree, const GlobalExchangeLists<IdxVec>& lists,
+                 std::span<Q> globQ, std::span<Q> sendBuf, std::span<Q> recvBuf, MPI_Comm comm, F&& upsweepFunction,
+                 UArgs&&... upsweepArgs)
 {
     GlobalExchangeRange functionRange("fmm:globalSweep");
+    const auto&         up              = lists.up;
+    const auto&         down            = lists.down;
+    const auto&         ownedParents    = lists.ownedParents;
     int                 numParentLevels = int(up.send.size());
 
     // Keep all messages in separate slices so later receives and earlier sends can remain active.

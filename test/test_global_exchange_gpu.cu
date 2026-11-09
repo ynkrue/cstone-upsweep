@@ -1,3 +1,4 @@
+#include "cstone/cuda/cuda_utils.cuh"
 #include "cstone/cuda/stream_holder.cuh"
 #include "global_exchange.hpp"
 
