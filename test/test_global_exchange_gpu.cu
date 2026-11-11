@@ -4,18 +4,10 @@
 
 namespace
 {
-__global__ void sumParents(TreeNodeIndex first, TreeNodeIndex last, const TreeNodeIndex* children, unsigned* q)
+__global__ void sumParents(TreeNodeIndex first, TreeNodeIndex last, const TreeNodeIndex* children, Q* q)
 {
     TreeNodeIndex i = first + blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < last && children[i])
-    {
-        unsigned sum = 0;
-        for (int k = 0; k < 8; ++k)
-        {
-            sum += q[children[i] + k];
-        }
-        q[i] = sum;
-    }
+    if (i < last && children[i]) { q[i] = SumChildren{}(i, children[i], q); }
 }
 } // namespace
 
@@ -38,7 +30,7 @@ int main(int argc, char** argv)
     {
         StreamHolder stream;
         auto         exec    = stream.exec();
-        auto         upsweep = [&](std::span<const TreeNodeIndex> ranges, const TreeNodeIndex* children, unsigned* q)
+        auto         upsweep = [&](std::span<const TreeNodeIndex> ranges, const TreeNodeIndex* children, Q* q)
         {
             for (int l = int(ranges.size()) - 2; l >= 0; --l)
             {
@@ -50,7 +42,15 @@ int main(int argc, char** argv)
                 }
             }
         };
-        status = testGlobalExchange<DeviceVector>(exec, upsweep, rank, numRanks);
+        auto computeParents = [&](std::span<const TreeNodeIndex> nodes, const TreeNodeIndex* children, Q* q)
+        {
+            for (TreeNodeIndex n : nodes)
+            {
+                sumParents<<<1, 1, 0, exec>>>(n, n + 1, children, q);
+                checkGpuErrors(cudaGetLastError());
+            }
+        };
+        status = testGlobalExchange<DeviceVector>(exec, upsweep, computeParents, rank, numRanks);
     }
     MPI_Finalize();
     return status;

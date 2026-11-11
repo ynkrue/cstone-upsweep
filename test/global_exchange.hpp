@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <span>
+#include <type_traits>
 #include <vector>
 #include <mpi.h>
 
@@ -23,8 +24,27 @@
 #include "global_sweep.hpp"
 
 using namespace global_sweep;
-using Q = unsigned;
-// using Q = std::array<double, 98>;
+using Q = util::array<double, 98>;
+// using Q = unsigned;
+
+//! @brief node value from its 8 children, always added in the order 0..7; NodeCount for counts, plain sum otherwise
+struct SumChildren
+{
+    template<class T>
+    HOST_DEVICE_FUN T operator()(TreeNodeIndex nodeIdx, TreeNodeIndex c, const T* q) const
+    {
+        if constexpr (std::is_arithmetic_v<T>) { return NodeCount<T>{}(nodeIdx, c, q); }
+        else
+        {
+            T sum = q[c];
+            for (int k = 1; k < 8; ++k)
+            {
+                sum += q[c + k];
+            }
+            return sum;
+        }
+    }
+};
 
 //! @brief copy the host tree into the execution space, stands in for buildOctreeGpu in GROMACS DomainFixed
 template<class Exec, class KeyType>
@@ -78,18 +98,27 @@ std::vector<uint8_t> flagLetNodes(OctreeView<const KeyType> gOctree, const KeyTy
 }
 
 //! @brief leaf values of repetition @p rep, different in every repetition so stale values fail the check
-inline void populate(int rep, std::span<Q> leafQ)
+template<class T>
+void populate(int rep, std::span<T> leafQ)
 {
     for (std::size_t i = 0; i < leafQ.size(); ++i)
     {
-        leafQ[i] = Q(i) + Q(rep) + 1;
+        // small integers, so that sums over the tree are exact; components differ by the factor k + 1
+        if constexpr (std::is_arithmetic_v<T>) { leafQ[i] = T(i + rep + 1); }
+        else
+        {
+            for (std::size_t k = 0; k < leafQ[i].size(); ++k)
+            {
+                leafQ[i][k] = double((i + rep + 1) * (k + 1));
+            }
+        }
     }
 }
 
-template<template<class...> class Vector, class Exec, class Upsweep>
-int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
+template<template<class...> class Vector, class Exec, class Upsweep, class ComputeParents>
+int testGlobalExchange(Exec exec, Upsweep upsweep, ComputeParents computeParents, int rank, int numRanks)
 {
-    using KeyType               = unsigned;
+    using KeyType = unsigned;
     constexpr double theta = 1.1;
     constexpr int reps = 10;
 
@@ -119,15 +148,20 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
 
     /// p2p setup, once
     Box<double> box(0, 1, BoundaryType::periodic);
-    double      start = 0;
     MPI_Barrier(MPI_COMM_WORLD);
-    start = MPI_Wtime();
+    double start = MPI_Wtime();
     std::vector<Vec4<double>> centers(hostTree.numNodes);
     geoMacSpheres(std::span<const KeyType>(hostTree.prefixes, hostTree.numNodes), centers.data(),
                   invThetaMinMac(theta), box);
     std::vector<TreeNodeIndex> farOffsets, farNodes;
     computeFarNodes<KeyType, double>(hostTree, leaves, displ, centers, box, farOffsets, farNodes);
+    auto   lists     = createSweepLists<KeyType>(hostTree, leaves, displ, farOffsets, farNodes, rank);
     double setupTime = MPI_Wtime() - start;
+
+    /// p2p buffers
+    Vector<TreeNodeIndex> sendIdx(lists.sendIdx), recvIdx(lists.recvIdx);
+    Vector<Q>             globQ(hostTree.numNodes), sendBuf(lists.sendIdx.size()), recvBuf(lists.recvIdx.size());
+    constexpr int         tag = 0;
 
     /// Allgather setup
     Vector<Q> allLeaves(hostTree.numLeafNodes);
@@ -143,11 +177,12 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
     std::vector<double> allgatherTime(reps);
     std::vector<double> p2pTime(reps);
     int                errors = 0;
+    int                p2pErrors = 0;
     for (int rep = 0; rep < reps; ++rep)
     {
-        populate(rep, leafQ);
+        populate(rep, std::span<Q>(leafQ));
         cstone::scatter(hostTree.leafToInternalSpan(), leafQ.data(), reference.data());
-        cstone::upsweep(hostTree.levelRangeSpan(), hostTree.childOffsets, reference.data(), NodeCount<Q>{});
+        cstone::upsweep(hostTree.levelRangeSpan(), hostTree.childOffsets, reference.data(), SumChildren{});
         Vector<Q> localQ(leafQ.data() + firstLeaf, leafQ.data() + firstLeaf + numLeaves);
         if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
 
@@ -170,13 +205,23 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
         /// distributed p2p upsweep
         MPI_Barrier(MPI_COMM_WORLD);
         start = MPI_Wtime();
-        // globalSweep goes here
-        if constexpr (execution::HaveGpu<Exec>{}) { syncGpu(exec); }
+        scatter(exec, gOctree.leafToInternalSpan().subspan(firstLeaf, numLeaves), localQ.data(), globQ.data());
+        globalSweep(exec, lists, {sendIdx.data(), sendIdx.size()}, {recvIdx.data(), recvIdx.size()},
+                    gOctree.childOffsets, std::span<Q>(globQ.data(), globQ.size()), {sendBuf.data(), sendBuf.size()},
+                    {recvBuf.data(), recvBuf.size()}, computeParents, tag, MPI_COMM_WORLD);
         p2pTime[rep] = MPI_Wtime() - start;
+
+        // check the far nodes of this rank from the p2p sweep
+        auto sweptQ = download(globQ);
+        for (TreeNodeIndex i = farOffsets[rank]; i < farOffsets[rank + 1]; ++i)
+        {
+            if (sweptQ[farNodes[i]] != reference[farNodes[i]]) { ++p2pErrors; }
+        }
     }
 
     // sum of errors, maximum of times over ranks
     MPI_Allreduce(MPI_IN_PLACE, &errors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(MPI_IN_PLACE, &p2pErrors, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &setupTime, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     std::vector<double> gatheredTimes(std::size_t(numRanks) * reps), gatheredP2pTimes(std::size_t(numRanks) * reps);
     MPI_Allgather(allgatherTime.data(), reps, MPI_DOUBLE, gatheredTimes.data(), reps, MPI_DOUBLE, MPI_COMM_WORLD);
@@ -203,7 +248,7 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
         std::printf("tree: P %d, %d leaves, %d leaves/rank, Q %zu B\n", numRanks, hostTree.numLeafNodes, numLeaves,
                     sizeof(Q));
         std::printf("p2p setup [ms]: %.3f\n", setupTime * 1e3);
-        std::printf("rep | allgather max [ms] | mean [ms] | median [ms] | p2p max [ms] | mean [ms] | median [ms]\n");
+        std::printf("rep | allgather max [ms] | mean [ms] | median [ms] |      p2p max [ms] | mean [ms] | median [ms]\n");
         for (int rep = 0; rep < reps; ++rep)
         {
             double max, mean, median, p2pMax, p2pMean, p2pMedian;
@@ -213,6 +258,7 @@ int testGlobalExchange(Exec exec, Upsweep upsweep, int rank, int numRanks)
                         median * 1e3, p2pMax * 1e3, p2pMean * 1e3, p2pMedian * 1e3);
         }
         std::printf("allgather upsweep: %s (%d errors)\n", errors ? "FAIL" : "PASS", errors);
+        std::printf("p2p sweep: %s (%d errors)\n", p2pErrors ? "FAIL" : "PASS", p2pErrors);
     }
-    return errors != 0;
+    return errors != 0 || p2pErrors != 0;
 }

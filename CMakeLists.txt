@@ -20,7 +20,7 @@ set(CSTONE_INCLUDE_DIR "${CSTONE_SOURCE_DIR}/include")
 add_executable(test_global_exchange test/test_global_exchange.cpp)
 add_executable(test_global_exchange_gpu
     test/test_global_exchange_gpu.cu
-    ${CSTONE_INCLUDE_DIR}/cstone/cuda/device_vector.cu
+    test/device_vector.cu
     ${CSTONE_INCLUDE_DIR}/cstone/primitives/primitives_gpu.cu)
 
 foreach(target test_global_exchange test_global_exchange_gpu)
